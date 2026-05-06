@@ -8,11 +8,16 @@ This document freezes **v1** so implementation can proceed without reinterpretat
 
 ## v1 CLI surface
 
-Default database path is `./wayfarer.db` unless `--db PATH` overrides.
+### CLI asset directory
+
+- Default **`~/.wfb/`** is the per-user **CLI asset directory** for all tools-managed files today and in the future (additional config/cache/log files could live beside the DB later).
+- The default relational store is **`~/.wfb/wayfarer.db`**.
+- **`--db PATH`** overrides only the SQLite file path (for projects, backups, tests, etc.). The asset-directory convention still applies when you omit `--db`.
 
 ### `wfb init [--db PATH]`
 
-- Creates `wayfarer.db` (or `PATH`) and applies v1 schema if missing.
+- Ensures **`~/.wfb/` exists** (`mkdir -p`), then applies the v1 schema to the target database (default `~/.wfb/wayfarer.db`).
+- Creates the DB file at `PATH` when missing.
 - **Idempotent:** safe to run multiple times (`CREATE TABLE IF NOT EXISTS`, etc.).
 - Ensures `schema_version` reflects v1 after successful init.
 
@@ -197,7 +202,7 @@ Top-level shape (field order not normative; keys must exist):
 ```json
 {
   "version": 1,
-  "db_path": "./wayfarer.db",
+  "db_path": "/Users/you/.wfb/wayfarer.db",
   "summary": {
     "tasks": {
       "pending": 0,
@@ -225,6 +230,7 @@ Top-level shape (field order not normative; keys must exist):
 }
 ```
 
+- `db_path` is the **resolved absolute path** to the database in use (default under `~/.wfb/wayfarer.db` when `--db` is omitted).
 - `highlights.*` arrays contain one object per row, with **keys matching SQL column names** (`id`, `title`, `status`, …, `metadata_json`, `updated_at`). Values are JSON types as returned from the DB (`metadata_json` remains a **string**).
 - Empty DB: counts zero, `highlights` empty arrays, `updated_at` values `null`.
 
@@ -247,6 +253,7 @@ Top-level shape (field order not normative; keys must exist):
 - **Language:** Python 3, stdlib only: `argparse`, `sqlite3`, `json`, `pathlib` (optional), `sys`.
 - **Commands:** `wfb init`, `wfb seed`, `wfb status` only.
 - **Binary name:** `wfb` everywhere.
+- **Default asset layout:** **`~/.wfb/`** is the CLI asset directory; **`wayfarer.db`** defaults there (`wfb_home()` / `default_db_path()` in `wfb.py` keep this centralized for future paths).
 - **Contract:** This README is the single source of truth for v1 until v2 is documented.
 
-No Python implementation is required to consider the **v1 contract frozen**; the next step is implementing `wfb` per this document.
+The reference implementation **`wfb.py`** should behave as specified above.
