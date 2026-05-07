@@ -156,6 +156,33 @@ class TestWfbGeminiApi(unittest.TestCase):
                     )
             self.assertIn("empty", str(ctx.exception))
 
+    def test_extract_world_state_envelope_parses_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            with mock.patch(
+                "wfb_gemini_api.ask_with_messages",
+                return_value='{"version":1,"active_tasks":[],"environmental_constraints":[],"style_specifications":[]}',
+            ):
+                out = api.extract_world_state_envelope(
+                    wfb_home=home,
+                    model="gemini-2.5-flash",
+                    session_id="sess_1",
+                    messages=[{"role": "user", "text": "x"}],
+                )
+            self.assertEqual(out["version"], 1)
+
+    def test_extract_world_state_envelope_invalid_json_raises(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            with mock.patch("wfb_gemini_api.ask_with_messages", return_value="not json"):
+                with self.assertRaises(api.GeminiApiError):
+                    api.extract_world_state_envelope(
+                        wfb_home=home,
+                        model="gemini-2.5-flash",
+                        session_id="sess_1",
+                        messages=[{"role": "user", "text": "x"}],
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

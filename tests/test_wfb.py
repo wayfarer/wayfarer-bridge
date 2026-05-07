@@ -535,6 +535,106 @@ class TestWfb(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertFalse(summarize.called)
 
+    def test_gemini_session_new_sets_world_state_sync_defaults(self):
+        sess = {"id": "sess_cfg", "name": "cfg", "model": "gemini-2.5-flash", "messages": []}
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.create_session", return_value=sess),
+            mock.patch("wfb.update_world_state_sync", return_value=sess) as update_sync,
+        ):
+            rc = wfb.main(
+                [
+                    "gemini",
+                    "session",
+                    "new",
+                    "--name",
+                    "cfg",
+                    "--sync-world-state",
+                    "on",
+                    "--world-state-db",
+                    "/tmp/world.db",
+                    "--world-state-scope",
+                    "dev",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            update_sync.assert_called_once()
+
+    def test_gemini_ask_sync_uses_session_default(self):
+        sess = {
+            "id": "sess_1",
+            "name": "sess_1",
+            "model": "gemini-2.5-flash",
+            "messages": [],
+            "world_state_sync": "on",
+            "world_state_db_path": "/tmp/world.db",
+            "world_state_scope": "sync-scope",
+        }
+        envelope = {"version": 1, "active_tasks": [], "environmental_constraints": [], "style_specifications": []}
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.load_session", return_value=sess),
+            mock.patch("wfb.get_active_session_id", return_value="sess_1"),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok"),
+            mock.patch("wfb.append_turn"),
+            mock.patch("wfb.extract_world_state_envelope", return_value=envelope),
+            mock.patch("wfb.validate_envelope", return_value=envelope),
+            mock.patch("wfb.connect_db") as connect_db,
+            mock.patch("wfb.require_v1_schema"),
+            mock.patch("wfb.seed_db") as seed_db,
+        ):
+            mock_conn = mock.Mock()
+            connect_db.return_value = mock_conn
+            rc = wfb.main(["gemini", "ask", "--prompt", "hello"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(seed_db.called)
+            mock_conn.close.assert_called_once()
+
+    def test_gemini_ask_sync_override_off_skips_sync(self):
+        sess = {
+            "id": "sess_1",
+            "name": "sess_1",
+            "model": "gemini-2.5-flash",
+            "messages": [],
+            "world_state_sync": "on",
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.load_session", return_value=sess),
+            mock.patch("wfb.get_active_session_id", return_value="sess_1"),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok"),
+            mock.patch("wfb.append_turn"),
+            mock.patch("wfb.extract_world_state_envelope") as extract_sync,
+        ):
+            rc = wfb.main(["gemini", "ask", "--prompt", "hello", "--sync-world-state", "off"])
+            self.assertEqual(rc, 0)
+            self.assertFalse(extract_sync.called)
+
+    def test_gemini_ask_sync_failure_is_non_fatal(self):
+        sess = {
+            "id": "sess_1",
+            "name": "sess_1",
+            "model": "gemini-2.5-flash",
+            "messages": [],
+            "world_state_sync": "on",
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.load_session", return_value=sess),
+            mock.patch("wfb.get_active_session_id", return_value="sess_1"),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok"),
+            mock.patch("wfb.append_turn"),
+            mock.patch(
+                "wfb.extract_world_state_envelope",
+                side_effect=wfb.GeminiApiError("extract failed"),
+            ),
+        ):
+            rc = wfb.main(["gemini", "ask", "--prompt", "hello"])
+            self.assertEqual(rc, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

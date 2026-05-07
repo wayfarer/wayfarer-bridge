@@ -253,6 +253,65 @@ def summarize_messages(
     return normalized
 
 
+def _first_json_object(text: str) -> dict[str, Any]:
+    s = text.strip()
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].startswith("```"):
+            s = "\n".join(lines[1:-1]).strip()
+    if not s:
+        raise GeminiApiError("world-state extraction returned empty text")
+    decoder = json.JSONDecoder()
+    start = s.find("{")
+    if start == -1:
+        raise GeminiApiError("world-state extraction did not contain a JSON object")
+    try:
+        obj, _ = decoder.raw_decode(s[start:])
+    except json.JSONDecodeError as e:
+        raise GeminiApiError(f"world-state extraction returned invalid JSON: {e}") from e
+    if not isinstance(obj, dict):
+        raise GeminiApiError("world-state extraction must be a JSON object")
+    return obj
+
+
+def extract_world_state_envelope(
+    *,
+    wfb_home: Path,
+    model: str,
+    session_id: str,
+    messages: list[dict[str, str]],
+) -> dict[str, Any]:
+    prompt_lines = [
+        "Extract durable world-state from this conversation as strict JSON only.",
+        "Return exactly one JSON object with schema:",
+        "{",
+        '  "version": 1,',
+        '  "source": "gemini_session:' + session_id + '",',
+        '  "active_tasks": [],',
+        '  "environmental_constraints": [],',
+        '  "style_specifications": []',
+        "}",
+        "Rules:",
+        "- Use only facts grounded in the provided conversation.",
+        "- Include only fields allowed by this schema.",
+        "- If uncertain, omit the record instead of guessing.",
+        "- Do not include markdown or explanatory text.",
+        "",
+    ]
+    for i, msg in enumerate(messages, start=1):
+        role = msg.get("role", "user")
+        text = msg.get("text", "")
+        if isinstance(text, str) and text.strip():
+            prompt_lines.append(f"{i}. {role}: {text}")
+    out = ask_with_messages(
+        wfb_home=wfb_home,
+        model=model,
+        messages=[{"role": "user", "text": "\n".join(prompt_lines)}],
+        system="You output strict JSON for deterministic state extraction.",
+    )
+    return _first_json_object(out)
+
+
 def api_managed_state_supported() -> dict[str, object]:
     """
     Current public REST usage provides no stable conversation/session handle fields.

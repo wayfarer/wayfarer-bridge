@@ -82,6 +82,22 @@ class TestWfbGeminiSessions(unittest.TestCase):
         self.assertEqual(len(original["messages"]), 3)
         self.assertEqual(compacted["messages"][0]["kind"], "history_summary")
 
+    def test_update_world_state_sync(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            created = sessions.create_session(home, name="demo", model="gemini-2.5-flash", system=None)
+            sid = str(created["id"])
+            updated = sessions.update_world_state_sync(
+                home,
+                session_id=sid,
+                sync_mode="on",
+                db_path="/tmp/world.db",
+                scope="dev",
+            )
+            assert updated is not None
+            self.assertTrue(sessions.world_state_sync_enabled(updated))
+            self.assertEqual(updated["world_state_db_path"], "/tmp/world.db")
+
 
 if __name__ == "__main__":
     unittest.main()

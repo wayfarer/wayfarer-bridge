@@ -39,6 +39,9 @@ def create_session(wfb_home: Path, *, name: str | None, model: str, system: str 
         "created_at": now,
         "updated_at": now,
         "messages": [],
+        "world_state_sync": "off",
+        "world_state_db_path": None,
+        "world_state_scope": None,
     }
     save_session(wfb_home, rec)
     set_active_session(wfb_home, sid)
@@ -193,3 +196,29 @@ def compacted_session_copy(
     }
     sess["messages"] = [summary_msg, *recent]
     return sess
+
+
+def update_world_state_sync(
+    wfb_home: Path,
+    *,
+    session_id: str,
+    sync_mode: str | None = None,
+    db_path: str | None = None,
+    scope: str | None = None,
+) -> dict[str, Any] | None:
+    sess = load_session(wfb_home, session_id)
+    if sess is None:
+        return None
+    if sync_mode is not None:
+        sess["world_state_sync"] = sync_mode
+    if db_path is not None:
+        sess["world_state_db_path"] = db_path
+    if scope is not None:
+        sess["world_state_scope"] = scope
+    save_session(wfb_home, sess)
+    return sess
+
+
+def world_state_sync_enabled(session: dict[str, Any]) -> bool:
+    mode = session.get("world_state_sync")
+    return mode == "on"

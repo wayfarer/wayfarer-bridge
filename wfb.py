@@ -19,6 +19,7 @@ from wfb_gemini_api import (
     GeminiApiError,
     api_managed_state_supported,
     ask_with_messages,
+    extract_world_state_envelope,
     list_models,
     summarization_policy_for_model,
     summarize_messages,
@@ -34,6 +35,8 @@ from wfb_gemini_sessions import (
     save_session,
     session_message_stats,
     set_active_session,
+    update_world_state_sync,
+    world_state_sync_enabled,
 )
 from wfb_oauth import (
     ensure_client_secret_present,
@@ -456,6 +459,38 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _warn_world_state_sync(msg: str) -> None:
+    print(f"world-state sync skipped: {msg}", file=sys.stderr)
+
+
+def _annotate_sync_envelope(
+    envelope: dict[str, Any], *, session_id: str, scope: str | None
+) -> dict[str, Any]:
+    out = dict(envelope)
+    out["source"] = f"gemini_session:{session_id}"
+    for key in ("active_tasks", "environmental_constraints", "style_specifications"):
+        rows = out.get(key)
+        if not isinstance(rows, list):
+            continue
+        new_rows: list[dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            row = dict(r)
+            md = row.get("metadata")
+            if not isinstance(md, dict):
+                md = {}
+            md = dict(md)
+            md["origin_session_id"] = session_id
+            if isinstance(scope, str) and scope:
+                md["world_state_scope"] = scope
+            row["metadata"] = md
+            row["source"] = out["source"]
+            new_rows.append(row)
+        out[key] = new_rows
+    return out
+
+
 def cmd_status(conn: sqlite3.Connection, db_path: Path, fmt: str, limit: int) -> None:
     if fmt == "json":
         payload = status_json(conn, db_path)
@@ -722,6 +757,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--summarize-model",
         help="optional model override used only for history summarization",
     )
+    ask.add_argument(
+        "--sync-world-state",
+        choices=("on", "off"),
+        default=None,
+        help="override session world-state sync mode for this ask",
+    )
+    ask.add_argument(
+        "--world-state-db",
+        help="override target world-state DB path for this ask",
+    )
 
     sess = gem_sub.add_parser("session", help="manage local Gemini chat sessions")
     sess_sub = sess.add_subparsers(dest="gemini_session_command", required=True)
@@ -731,8 +776,24 @@ def build_parser() -> argparse.ArgumentParser:
     newp.add_argument("--name", help="optional human-readable session name")
     newp.add_argument("--model", default=DEFAULT_MODEL, help=f"default model (default: {DEFAULT_MODEL})")
     newp.add_argument("--system", help="optional default system instruction")
+    newp.add_argument(
+        "--sync-world-state",
+        choices=("on", "off"),
+        default=None,
+        help="default world-state sync mode for this session",
+    )
+    newp.add_argument("--world-state-db", help="default world-state DB path for this session")
+    newp.add_argument("--world-state-scope", help="optional scope tag for synced records")
     usep = sess_sub.add_parser("use", help="select an existing session as active")
     usep.add_argument("--id", required=True, help="session id")
+    usep.add_argument(
+        "--sync-world-state",
+        choices=("on", "off"),
+        default=None,
+        help="update world-state sync mode while selecting the session",
+    )
+    usep.add_argument("--world-state-db", help="update default world-state DB path for this session")
+    usep.add_argument("--world-state-scope", help="update default world-state scope for this session")
     resetp = sess_sub.add_parser("reset", help="clear session message history")
     resetp.add_argument("--id", help="session id (defaults to active session)")
     insp = sess_sub.add_parser("inspect", help="print session record")
@@ -893,6 +954,37 @@ def main(argv: list[str] | None = None) -> int:
                     save_session(wfb_home(), pending_compacted)
                 append_turn(wfb_home(), sid, role="user", text=args.prompt)
                 append_turn(wfb_home(), sid, role="model", text=answer)
+
+                sync_on = (
+                    args.sync_world_state
+                    if args.sync_world_state is not None
+                    else ("on" if world_state_sync_enabled(sess) else "off")
+                )
+                if sync_on == "on":
+                    target_db_path = args.world_state_db or sess.get("world_state_db_path") or str(db_path)
+                    scope = sess.get("world_state_scope")
+                    try:
+                        extraction = extract_world_state_envelope(
+                            wfb_home=wfb_home(),
+                            model=model,
+                            session_id=sid,
+                            messages=[*normalized, {"role": "model", "text": answer}],
+                        )
+                        annotated = _annotate_sync_envelope(
+                            extraction,
+                            session_id=sid,
+                            scope=scope if isinstance(scope, str) else None,
+                        )
+                        normalized_env = validate_envelope(annotated)
+                        sync_conn = connect_db(target_db_path)
+                        try:
+                            require_v1_schema(sync_conn)
+                            seed_db(sync_conn, normalized_env, replace=False)
+                        finally:
+                            sync_conn.close()
+                    except (GeminiApiError, ValidationError, sqlite3.Error, OSError) as e:
+                        _warn_world_state_sync(str(e))
+
                 print(answer)
                 return EXIT_OK
 
@@ -929,6 +1021,20 @@ def main(argv: list[str] | None = None) -> int:
                         model=args.model,
                         system=args.system,
                     )
+                    if (
+                        args.sync_world_state is not None
+                        or args.world_state_db is not None
+                        or args.world_state_scope is not None
+                    ):
+                        updated = update_world_state_sync(
+                            wfb_home(),
+                            session_id=str(sess["id"]),
+                            sync_mode=args.sync_world_state,
+                            db_path=args.world_state_db,
+                            scope=args.world_state_scope,
+                        )
+                        if updated is not None:
+                            sess = updated
                     print(str(sess["id"]))
                     return EXIT_OK
 
@@ -937,6 +1043,21 @@ def main(argv: list[str] | None = None) -> int:
                         _err(f"session not found: {args.id}")
                         return EXIT_IO
                     set_active_session(wfb_home(), args.id)
+                    if (
+                        args.sync_world_state is not None
+                        or args.world_state_db is not None
+                        or args.world_state_scope is not None
+                    ):
+                        updated = update_world_state_sync(
+                            wfb_home(),
+                            session_id=args.id,
+                            sync_mode=args.sync_world_state,
+                            db_path=args.world_state_db,
+                            scope=args.world_state_scope,
+                        )
+                        if updated is None:
+                            _err(f"session not found: {args.id}")
+                            return EXIT_IO
                     print(args.id)
                     return EXIT_OK
 
