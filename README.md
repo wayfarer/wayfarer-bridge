@@ -16,6 +16,8 @@ This document freezes **v1** so implementation can proceed without reinterpretat
 
 ### `wfb init [--db PATH]`
 
+- Requires a local OAuth desktop client secret at **`~/.wfb/client_secret.json`** for the OSS/PyPI build.
+- If missing, `init` always prints setup instructions and the official OAuth guide URL, then attempts to open the guide in your browser.
 - Ensures **`~/.wfb/` exists** (`mkdir -p`), then applies the v1 schema to the target database (default `~/.wfb/wayfarer.db`).
 - Creates the DB file at `PATH` when missing.
 - **Idempotent:** safe to run multiple times (`CREATE TABLE IF NOT EXISTS`, etc.).
@@ -36,6 +38,25 @@ This document freezes **v1** so implementation can proceed without reinterpretat
 - **`--limit N`:** caps list previews in text mode (default **5**); applies to highlighted rows where lists are truncated.
 
 Optional future commands (`export`, `validate`) are **out of scope** for v1; v1 ships only **`init`**, **`seed`**, **`status`**.
+
+---
+
+## OAuth setup prerequisite (OSS/PyPI)
+
+The open-source `wfb` CLI does **not** ship centralized OAuth client secrets. You must provide your own Desktop OAuth client JSON at:
+
+- **`~/.wfb/client_secret.json`**
+
+Setup reference:
+
+- [Gemini OAuth quickstart](https://ai.google.dev/gemini-api/docs/oauth)
+
+Minimum steps:
+
+1. Create a Google Cloud project and enable the Generative Language API.
+2. Configure OAuth consent screen and add yourself as a test user while developing.
+3. Create an OAuth **Desktop app** client, download the JSON, and place it at `~/.wfb/client_secret.json`.
+4. Run `wfb init` again.
 
 ---
 
