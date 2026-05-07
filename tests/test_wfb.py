@@ -732,14 +732,47 @@ class TestWfb(unittest.TestCase):
             rc = wfb.main(["chrome", "targets", "--include-types", "page,iframe"])
             self.assertEqual(rc, 5)
 
+    def test_chrome_targets_unreachable_includes_recovery_hint(self):
+        with (
+            mock.patch("wfb.parse_target_types", return_value=("page",)),
+            mock.patch("wfb.list_targets", side_effect=wfb.ChromeBridgeError("connection refused")),
+            mock.patch("sys.stderr") as err,
+        ):
+            rc = wfb.main(["chrome", "targets", "--port", "9333"])
+            self.assertEqual(rc, 5)
+            written = "".join(call.args[0] for call in err.write.call_args_list if call.args)
+            self.assertIn("next steps:", written)
+
     def test_chrome_launch_reports_already_running(self):
-        payload = {"Browser": "Chrome/136", "already_running": True}
+        payload = {
+            "Browser": "Chrome/136",
+            "already_running": True,
+            "fallback_used": False,
+            "requested_port": 9222,
+            "resolved_port": 9222,
+        }
         with mock.patch("wfb.launch_chrome_debug", return_value=payload):
             with mock.patch("sys.stdout") as out:
                 rc = wfb.main(["chrome", "launch", "--format", "text"])
             self.assertEqual(rc, 0)
             written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
             self.assertIn("already_running: True", written)
+
+    def test_chrome_launch_reports_fallback_port(self):
+        payload = {
+            "Browser": "Chrome/136",
+            "already_running": True,
+            "fallback_used": True,
+            "requested_port": 9222,
+            "resolved_port": 9333,
+        }
+        with mock.patch("wfb.launch_chrome_debug", return_value=payload):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["chrome", "launch", "--format", "text", "--port", "9222"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            self.assertIn("Chrome debug ready on port 9333", written)
+            self.assertIn("fallback_used: True", written)
 
     def test_chrome_launch_rejects_invalid_timeout(self):
         rc = wfb.main(["chrome", "launch", "--timeout-seconds", "0"])
@@ -755,6 +788,28 @@ class TestWfb(unittest.TestCase):
             self.assertEqual(rc, 0)
             written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
             self.assertIn("detached", written)
+
+    def test_chrome_current_defaults_to_json(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb._chrome_current_payload", return_value={"attached": False}),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["chrome", "current"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            self.assertIn('"attached": false', written)
+
+    def test_chrome_current_text_when_unattached(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb._chrome_current_payload", return_value={"attached": False}),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["chrome", "current", "--format", "text"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            self.assertIn("no attachment", written)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ DEFAULT_TIMEOUT_SECONDS = 5.0
 MAX_TEXT_SNAPSHOT_CHARS = 4000
 DEFAULT_TARGET_TYPES = ("page",)
 SUPPORTED_TARGET_TYPES = frozenset({"page", "webview"})
+DEFAULT_PORT_CANDIDATES = (9222, 9223, 9224, 9333)
 
 
 class ChromeBridgeError(Exception):
@@ -71,6 +72,21 @@ def fetch_version(**kwargs: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ChromeBridgeError("invalid /json/version payload")
     return payload
+
+
+def detect_debug_ports(
+    candidates: tuple[int, ...] = DEFAULT_PORT_CANDIDATES,
+    *,
+    timeout_seconds: float = 1.0,
+) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for port in candidates:
+        try:
+            ver = fetch_version(port=port, timeout_seconds=timeout_seconds)
+        except ChromeBridgeError:
+            continue
+        found.append({"port": int(port), "version": ver})
+    return found
 
 
 def fetch_targets(**kwargs: Any) -> list[dict[str, Any]]:
@@ -171,11 +187,26 @@ def launch_chrome_debug(
     try:
         existing = fetch_version(port=port)
         existing["debug_port"] = port
+        existing["requested_port"] = port
+        existing["resolved_port"] = port
+        existing["fallback_used"] = False
         existing["profile_mode"] = profile_mode
         existing["already_running"] = True
         return existing
     except ChromeBridgeError:
-        pass
+        detected = detect_debug_ports(timeout_seconds=1.0)
+        if detected:
+            first = detected[0]
+            ver = dict(first["version"])
+            resolved_port = int(first["port"])
+            ver["debug_port"] = resolved_port
+            ver["requested_port"] = port
+            ver["resolved_port"] = resolved_port
+            ver["fallback_used"] = resolved_port != port
+            ver["profile_mode"] = profile_mode
+            ver["already_running"] = True
+            ver["detected_ports"] = [int(d["port"]) for d in detected]
+            return ver
 
     exe = find_chrome_executable(chrome_path)
     args = _chrome_launch_args(
@@ -200,6 +231,9 @@ def launch_chrome_debug(
         try:
             ver = fetch_version(port=port)
             ver["debug_port"] = port
+            ver["requested_port"] = port
+            ver["resolved_port"] = port
+            ver["fallback_used"] = False
             ver["profile_mode"] = profile_mode
             ver["already_running"] = False
             return ver

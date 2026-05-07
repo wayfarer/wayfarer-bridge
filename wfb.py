@@ -17,6 +17,7 @@ from wfb_chrome_bridge import (
     DEFAULT_DEBUG_PORT,
     ChromeBridgeError,
     choose_target,
+    fetch_version,
     inspect_target,
     launch_chrome_debug,
     list_targets,
@@ -488,6 +489,39 @@ def _warn_world_state_sync(msg: str) -> None:
     print(f"world-state sync skipped: {msg}", file=sys.stderr)
 
 
+def _chrome_recovery_hint(port: int) -> str:
+    return (
+        f"next steps: try `wfb chrome launch --port {port}` or "
+        f"`wfb chrome targets --port {port} --include-types page,webview --gemini-only`"
+    )
+
+
+def _chrome_current_payload(home: Path, fallback_port: int = DEFAULT_DEBUG_PORT) -> dict[str, Any]:
+    attachment = load_chrome_attachment(home)
+    payload: dict[str, Any] = {
+        "attached": attachment is not None,
+        "attachment": attachment,
+        "endpoint": {"reachable": False, "port": None, "browser": None},
+        "target_present": None,
+    }
+    if attachment is None:
+        return payload
+    saved_port = attachment.get("debug_port")
+    port = int(saved_port) if isinstance(saved_port, int) else fallback_port
+    payload["endpoint"]["port"] = port
+    try:
+        version = fetch_version(port=port)
+        payload["endpoint"]["reachable"] = True
+        payload["endpoint"]["browser"] = str(version.get("Browser", ""))
+    except ChromeBridgeError:
+        payload["endpoint"]["reachable"] = False
+        return payload
+    target_id = str(attachment.get("target_id", ""))
+    targets = list_targets(port=port, include_types=("page", "webview"))
+    payload["target_present"] = any(str(t.get("id", "")) == target_id for t in targets)
+    return payload
+
+
 def _annotate_sync_envelope(
     envelope: dict[str, Any], *, session_id: str, scope: str | None
 ) -> dict[str, Any]:
@@ -946,6 +980,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     c_detach = chrome_sub.add_parser("detach", help="clear persisted Chrome target attachment")
     c_detach.add_argument("--format", choices=("text", "json"), default="text")
+    c_current = chrome_sub.add_parser("current", help="show current attached target and endpoint health")
+    c_current.add_argument("--format", choices=("json", "text"), default="json")
     p.set_defaults(
         file=None,
         json_data=None,
@@ -1271,10 +1307,14 @@ def main(argv: list[str] | None = None) -> int:
                     print(json.dumps(payload, indent=2, sort_keys=True))
                 else:
                     browser = payload.get("Browser", "unknown")
-                    print(f"Chrome debug ready on port {args.port}")
+                    resolved = int(payload.get("resolved_port", args.port))
+                    print(f"Chrome debug ready on port {resolved}")
                     print(f"Browser: {browser}")
                     print(f"profile_mode: {args.profile_mode}")
                     print(f"already_running: {bool(payload.get('already_running', False))}")
+                    print(f"fallback_used: {bool(payload.get('fallback_used', False))}")
+                    if int(payload.get("requested_port", args.port)) != resolved:
+                        print(f"requested_port: {args.port}")
                 return EXIT_OK
 
             if args.chrome_command == "targets":
@@ -1282,11 +1322,15 @@ def main(argv: list[str] | None = None) -> int:
                     _err("--port must be positive")
                     return EXIT_USAGE
                 selected_types = parse_target_types(args.include_types)
-                targets = list_targets(
-                    port=args.port,
-                    include_types=selected_types,
-                    gemini_only=bool(args.gemini_only),
-                )
+                try:
+                    targets = list_targets(
+                        port=args.port,
+                        include_types=selected_types,
+                        gemini_only=bool(args.gemini_only),
+                    )
+                except ChromeBridgeError as e:
+                    _err(f"{e}; {_chrome_recovery_hint(args.port)}")
+                    return EXIT_IO
                 if args.format == "json":
                     out = []
                     for t in targets:
@@ -1314,11 +1358,15 @@ def main(argv: list[str] | None = None) -> int:
                     _err("--port must be positive")
                     return EXIT_USAGE
                 selected_types = parse_target_types(args.include_types)
-                targets = list_targets(port=args.port, include_types=selected_types)
+                try:
+                    targets = list_targets(port=args.port, include_types=selected_types)
+                except ChromeBridgeError as e:
+                    _err(f"{e}; {_chrome_recovery_hint(args.port)}")
+                    return EXIT_IO
                 try:
                     target = choose_target(targets, args.target_id)
                 except ChromeBridgeError as e:
-                    _err(f"{e}; try --include-types page,webview")
+                    _err(f"{e}; try --include-types page,webview; {_chrome_recovery_hint(args.port)}")
                     return EXIT_IO
                 ws_url = str(target.get("webSocketDebuggerUrl", ""))
                 if not ws_url:
@@ -1354,11 +1402,18 @@ def main(argv: list[str] | None = None) -> int:
 
                 if target_id:
                     resolved_port = port if port is not None else DEFAULT_DEBUG_PORT
-                    targets = list_targets(port=resolved_port, include_types=selected_types)
+                    try:
+                        targets = list_targets(port=resolved_port, include_types=selected_types)
+                    except ChromeBridgeError as e:
+                        _err(f"{e}; {_chrome_recovery_hint(resolved_port)}")
+                        return EXIT_IO
                     try:
                         target = choose_target(targets, target_id)
                     except ChromeBridgeError as e:
-                        _err(f"{e}; try --include-types page,webview")
+                        _err(
+                            f"{e}; try --include-types page,webview; "
+                            f"{_chrome_recovery_hint(resolved_port)}"
+                        )
                         return EXIT_IO
                     ws_url = str(target.get("webSocketDebuggerUrl", ""))
                     port = resolved_port
@@ -1375,11 +1430,15 @@ def main(argv: list[str] | None = None) -> int:
                             port = saved_port
                         else:
                             port = DEFAULT_DEBUG_PORT
-                    targets = list_targets(port=port, include_types=selected_types)
+                    try:
+                        targets = list_targets(port=port, include_types=selected_types)
+                    except ChromeBridgeError as e:
+                        _err(f"{e}; {_chrome_recovery_hint(port)}")
+                        return EXIT_IO
                     try:
                         target = choose_target(targets, target_id)
                     except ChromeBridgeError as e:
-                        _err(f"{e}; try --include-types page,webview")
+                        _err(f"{e}; try --include-types page,webview; {_chrome_recovery_hint(port)}")
                         return EXIT_IO
 
                 if not ws_url:
@@ -1419,6 +1478,24 @@ def main(argv: list[str] | None = None) -> int:
                         print("detached")
                     else:
                         print("no attachment")
+                return EXIT_OK
+
+            if args.chrome_command == "current":
+                payload = _chrome_current_payload(wfb_home())
+                if args.format == "json":
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    if not payload.get("attached"):
+                        print("no attachment")
+                        return EXIT_OK
+                    attachment = payload.get("attachment", {}) if isinstance(payload.get("attachment"), dict) else {}
+                    endpoint = payload.get("endpoint", {}) if isinstance(payload.get("endpoint"), dict) else {}
+                    print(f"target_id: {attachment.get('target_id','')}")
+                    print(f"title: {attachment.get('title','')}")
+                    print(f"url: {attachment.get('url','')}")
+                    print(f"debug_port: {endpoint.get('port')}")
+                    print(f"endpoint_reachable: {bool(endpoint.get('reachable', False))}")
+                    print(f"target_present: {payload.get('target_present')}")
                 return EXIT_OK
         except ChromeBridgeError as e:
             _err(str(e))

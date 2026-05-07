@@ -32,6 +32,16 @@ class _FakeSocket:
 
 
 class TestWfbChromeBridge(unittest.TestCase):
+    def test_detect_debug_ports_returns_healthy_entries(self):
+        with mock.patch.object(
+            bridge,
+            "fetch_version",
+            side_effect=[bridge.ChromeBridgeError("down"), {"Browser": "Chrome/1"}],
+        ):
+            out = bridge.detect_debug_ports(candidates=(9222, 9333))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["port"], 9333)
+
     def test_parse_target_types_default(self):
         self.assertEqual(bridge.parse_target_types(None), ("page",))
 
@@ -78,6 +88,7 @@ class TestWfbChromeBridge(unittest.TestCase):
                 "fetch_version",
                 side_effect=[bridge.ChromeBridgeError("no endpoint"), {"Browser": "Chrome/2"}],
             ) as fetch_version,
+            mock.patch.object(bridge, "detect_debug_ports", return_value=[]),
             mock.patch.object(bridge, "find_chrome_executable", return_value="/Applications/Chrome") as find_chrome,
             mock.patch.object(bridge.subprocess, "Popen") as popen,
         ):
@@ -87,6 +98,25 @@ class TestWfbChromeBridge(unittest.TestCase):
         find_chrome.assert_called_once()
         popen.assert_called_once()
         self.assertEqual(fetch_version.call_count, 2)
+
+    def test_launch_falls_back_to_detected_port(self):
+        with (
+            mock.patch.object(bridge, "fetch_version", side_effect=bridge.ChromeBridgeError("down")),
+            mock.patch.object(
+                bridge,
+                "detect_debug_ports",
+                return_value=[{"port": 9333, "version": {"Browser": "Chrome/Detected"}}],
+            ),
+            mock.patch.object(bridge, "find_chrome_executable") as find_chrome,
+            mock.patch.object(bridge.subprocess, "Popen") as popen,
+        ):
+            out = bridge.launch_chrome_debug(port=9222)
+        self.assertEqual(out["requested_port"], 9222)
+        self.assertEqual(out["resolved_port"], 9333)
+        self.assertEqual(out["fallback_used"], True)
+        self.assertTrue(out["already_running"])
+        find_chrome.assert_not_called()
+        popen.assert_not_called()
 
     def test_encode_frame_masks_payload(self):
         frame = bridge._encode_ws_frame(b"hello", opcode=0x1, masked=True)
