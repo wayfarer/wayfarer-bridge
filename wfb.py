@@ -10,6 +10,7 @@ import argparse
 import json
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -68,19 +69,25 @@ EXIT_DB = 4
 EXIT_IO = 5
 
 DEFAULT_STATUS_LIMIT = 5
+BRIDGE_PROMPT_TEMPLATE_VERSION = "1"
 AGENT_WORKFLOW_GUIDANCE = """Agent workflow guidance:
   1) Initialize once: `wfb init`
-  2) For browser-context capture:
+  2) One-shot browser-to-Gemini bridge:
+       - `wfb bridge ask --prompt "summarize this page" --format json`
+       (runs capture -> prompt envelope -> gemini ask in a single call)
+  3) Iterative automation:
+       - `wfb bridge loop --prompt "check for updates" --max-iterations 5`
+       (bounded loop: capture -> ask each iteration, stops on budget/stability/error)
+  4) For manual browser-context capture:
+       - `wfb chrome capture --format json`
        - `wfb chrome targets --include-types page,webview --gemini-only`
-       - `wfb chrome attach --target-id <id> --include-types page,webview`
-       - `wfb chrome inspect --include-types page,webview --format json`
-  3) For durable local memory and model control:
+  5) For durable local memory and model control:
        - create/select session with `wfb gemini session new|use`
        - run asks with `wfb gemini ask --session <id> ...`
-  4) State ownership:
+  6) State ownership:
        - browser panel text = live context source
        - local gemini session = durable agent execution history
-  5) Optional persistence:
+  7) Optional persistence:
        - enable `--sync-world-state on` when chat context should update SQLite world state.
 """
 
@@ -549,6 +556,31 @@ def _list_targets_with_port_fallback(
             except ChromeBridgeError:
                 continue
         raise
+
+
+def _build_bridge_prompt(
+    *,
+    user_prompt: str,
+    text_snapshot: str,
+    page_title: str,
+    page_url: str,
+    snapshot_chars: int,
+    snapshot_truncated: bool,
+) -> str:
+    parts = [
+        f"Page title: {page_title}",
+        f"Page URL: {page_url}",
+        f"Snapshot chars: {snapshot_chars}",
+    ]
+    if snapshot_truncated:
+        parts.append("Note: snapshot was truncated to fit max-chars limit.")
+    parts.append("")
+    parts.append("--- PAGE CONTENT ---")
+    parts.append(text_snapshot)
+    parts.append("--- END PAGE CONTENT ---")
+    parts.append("")
+    parts.append(f"User request: {user_prompt}")
+    return "\n".join(parts)
 
 
 def _annotate_sync_envelope(
@@ -1032,6 +1064,83 @@ def build_parser() -> argparse.ArgumentParser:
         help="max snapshot text chars (default: 4000)",
     )
     c_capture.add_argument("--format", choices=("json", "text"), default="json")
+
+    bridge = sub.add_parser(
+        "bridge",
+        help="browser-to-Gemini bridge workflows",
+        description=(
+            "Orchestrate capture -> prompt -> Gemini ask in a single command.\n"
+            "Runs `chrome capture` internally, builds a prompt envelope from the\n"
+            "page snapshot, sends it to Gemini, and returns combined provenance."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    bridge_sub = bridge.add_subparsers(dest="bridge_command", required=True)
+
+    b_ask = bridge_sub.add_parser("ask", help="capture browser context and ask Gemini about it")
+    b_ask.add_argument("--prompt", required=True, help="question or instruction for Gemini about the captured page")
+    b_ask.add_argument("--session", help="target Gemini session id (default: active session)")
+    b_ask.add_argument("--model", default=DEFAULT_MODEL, help=f"Gemini model (default: {DEFAULT_MODEL})")
+    b_ask.add_argument("--system", help="optional system instruction for Gemini")
+    b_ask.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_DEBUG_PORT,
+        help=f"Chrome debug port (default: {DEFAULT_DEBUG_PORT})",
+    )
+    b_ask.add_argument("--target-id", help="explicit Chrome target id override")
+    b_ask.add_argument(
+        "--include-types",
+        default="page,webview",
+        help="comma-separated target types (default: page,webview)",
+    )
+    b_ask.add_argument("--gemini-only", action="store_true", help="restrict capture to Gemini targets")
+    b_ask.add_argument(
+        "--max-chars",
+        type=int,
+        default=4000,
+        help="max snapshot text chars (default: 4000)",
+    )
+    b_ask.add_argument("--format", choices=("json", "text"), default="json")
+
+    b_loop = bridge_sub.add_parser("loop", help="iterative capture-and-ask automation loop")
+    b_loop.add_argument("--prompt", required=True, help="question or instruction applied each iteration")
+    b_loop.add_argument(
+        "--max-iterations",
+        type=int,
+        default=3,
+        help="upper bound on iteration count (default: 3)",
+    )
+    b_loop.add_argument(
+        "--stability-check",
+        choices=("on", "off"),
+        default="off",
+        help="stop early if page snapshot is unchanged between iterations (default: off)",
+    )
+    b_loop.add_argument("--session", help="target Gemini session id (default: active session)")
+    b_loop.add_argument("--model", default=DEFAULT_MODEL, help=f"Gemini model (default: {DEFAULT_MODEL})")
+    b_loop.add_argument("--system", help="optional system instruction for Gemini")
+    b_loop.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_DEBUG_PORT,
+        help=f"Chrome debug port (default: {DEFAULT_DEBUG_PORT})",
+    )
+    b_loop.add_argument("--target-id", help="explicit Chrome target id override")
+    b_loop.add_argument(
+        "--include-types",
+        default="page,webview",
+        help="comma-separated target types (default: page,webview)",
+    )
+    b_loop.add_argument("--gemini-only", action="store_true", help="restrict capture to Gemini targets")
+    b_loop.add_argument(
+        "--max-chars",
+        type=int,
+        default=4000,
+        help="max snapshot text chars (default: 4000)",
+    )
+    b_loop.add_argument("--format", choices=("json", "text"), default="json")
+
     p.set_defaults(
         file=None,
         json_data=None,
@@ -1614,6 +1723,342 @@ def main(argv: list[str] | None = None) -> int:
                     print(payload["inspect"].get("text_snapshot", ""))
                 return EXIT_OK
         except ChromeBridgeError as e:
+            _err(str(e))
+            return EXIT_IO
+
+    if args.command == "bridge":
+        try:
+            if args.bridge_command == "ask":
+                if args.max_chars <= 0:
+                    _err("--max-chars must be positive")
+                    return EXIT_USAGE
+                if args.port <= 0:
+                    _err("--port must be positive")
+                    return EXIT_USAGE
+
+                selected_types = parse_target_types(args.include_types)
+                try:
+                    targets, resolved_port = _list_targets_with_port_fallback(
+                        port=args.port,
+                        include_types=selected_types,
+                        gemini_only=bool(args.gemini_only),
+                    )
+                except ChromeBridgeError as e:
+                    _err(f"capture stage failed: {e}; {_chrome_recovery_hint(args.port)}")
+                    return EXIT_IO
+                try:
+                    target, selection_method, selection_reason = select_capture_target(
+                        targets,
+                        target_id=args.target_id,
+                    )
+                except ChromeBridgeError as e:
+                    _err(f"capture stage failed: {e}; {_chrome_recovery_hint(resolved_port)}")
+                    return EXIT_IO
+                ws_url = str(target.get("webSocketDebuggerUrl", ""))
+                if not ws_url:
+                    _err("capture stage failed: selected target missing websocket debugger url")
+                    return EXIT_IO
+                save_attachment(
+                    wfb_home(),
+                    target_id=str(target.get("id", "")),
+                    ws_url=ws_url,
+                    url=str(target.get("url", "")),
+                    title=str(target.get("title", "")),
+                    debug_port=resolved_port,
+                )
+                inspect_result = inspect_target(
+                    ws_url=ws_url,
+                    max_chars=args.max_chars,
+                )
+
+                text_snapshot = str(inspect_result.get("text_snapshot", ""))
+                page_title = str(inspect_result.get("title", target.get("title", "")))
+                page_url = str(inspect_result.get("url", target.get("url", "")))
+                snapshot_chars = int(inspect_result.get("text_snapshot_chars", len(text_snapshot)))
+                snapshot_truncated = bool(inspect_result.get("text_snapshot_truncated", False))
+
+                composed_prompt = _build_bridge_prompt(
+                    user_prompt=args.prompt,
+                    text_snapshot=text_snapshot,
+                    page_title=page_title,
+                    page_url=page_url,
+                    snapshot_chars=snapshot_chars,
+                    snapshot_truncated=snapshot_truncated,
+                )
+
+                sid = args.session or get_active_session_id(wfb_home())
+                if sid:
+                    sess = load_session(wfb_home(), sid)
+                else:
+                    sess = None
+                if sess is None:
+                    sess = create_session(
+                        wfb_home(),
+                        name=None,
+                        model=args.model,
+                        system=args.system,
+                    )
+                    sid = str(sess["id"])
+                assert sid is not None
+                set_active_session(wfb_home(), sid)
+
+                model = args.model or str(sess.get("model", DEFAULT_MODEL))
+                system = args.system if args.system is not None else sess.get("system")
+
+                try:
+                    answer = ask_with_messages(
+                        wfb_home=wfb_home(),
+                        model=model,
+                        messages=[{"role": "user", "text": composed_prompt}],
+                        system=system if isinstance(system, str) else None,
+                    )
+                except GeminiApiError as e:
+                    _err(f"ask stage failed: {e}")
+                    return EXIT_IO
+
+                append_turn(wfb_home(), sid, role="user", text=composed_prompt)
+                append_turn(wfb_home(), sid, role="model", text=answer)
+
+                payload: dict[str, Any] = {
+                    "capture": {
+                        "selection": {"method": selection_method, "reason": selection_reason},
+                        "target": {
+                            "id": str(target.get("id", "")),
+                            "title": page_title,
+                            "url": page_url,
+                            "type": str(target.get("type", "")),
+                        },
+                        "snapshot_chars": snapshot_chars,
+                        "snapshot_truncated": snapshot_truncated,
+                        "debug": {"requested_port": int(args.port), "resolved_port": int(resolved_port)},
+                    },
+                    "prompt_envelope": {
+                        "template_version": BRIDGE_PROMPT_TEMPLATE_VERSION,
+                        "user_prompt": args.prompt,
+                        "composed_prompt_chars": len(composed_prompt),
+                    },
+                    "gemini_response": {
+                        "model": model,
+                        "session_id": sid,
+                        "answer": answer,
+                    },
+                }
+                if args.format == "json":
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    print(f"target: {page_title} ({page_url})")
+                    print(f"selection: {selection_method}")
+                    print(f"model: {model}")
+                    print(f"session: {sid}")
+                    print("---")
+                    print(answer)
+                return EXIT_OK
+
+            if args.bridge_command == "loop":
+                if args.max_chars <= 0:
+                    _err("--max-chars must be positive")
+                    return EXIT_USAGE
+                if args.port <= 0:
+                    _err("--port must be positive")
+                    return EXIT_USAGE
+                if args.max_iterations <= 0:
+                    _err("--max-iterations must be positive")
+                    return EXIT_USAGE
+
+                selected_types = parse_target_types(args.include_types)
+                stability_check = args.stability_check == "on"
+
+                sid = args.session or get_active_session_id(wfb_home())
+                if sid:
+                    sess = load_session(wfb_home(), sid)
+                else:
+                    sess = None
+                if sess is None:
+                    sess = create_session(
+                        wfb_home(),
+                        name=None,
+                        model=args.model,
+                        system=args.system,
+                    )
+                    sid = str(sess["id"])
+                assert sid is not None
+                set_active_session(wfb_home(), sid)
+
+                model = args.model or str(sess.get("model", DEFAULT_MODEL))
+                system = args.system if args.system is not None else sess.get("system")
+
+                run_start = _utc_now_iso()
+                iterations: list[dict[str, Any]] = []
+                stop_reason = "max_iterations"
+                prev_snapshot = ""
+
+                for iteration_num in range(1, args.max_iterations + 1):
+                    step: dict[str, Any] = {"iteration": iteration_num}
+
+                    try:
+                        targets, resolved_port = _list_targets_with_port_fallback(
+                            port=args.port,
+                            include_types=selected_types,
+                            gemini_only=bool(args.gemini_only),
+                        )
+                    except ChromeBridgeError as e:
+                        step["status"] = "error"
+                        step["error"] = f"capture stage failed: {e}"
+                        iterations.append(step)
+                        stop_reason = "error"
+                        break
+                    try:
+                        target, selection_method, selection_reason = select_capture_target(
+                            targets,
+                            target_id=args.target_id,
+                        )
+                    except ChromeBridgeError as e:
+                        step["status"] = "error"
+                        step["error"] = f"capture stage failed: {e}"
+                        iterations.append(step)
+                        stop_reason = "error"
+                        break
+                    ws_url = str(target.get("webSocketDebuggerUrl", ""))
+                    if not ws_url:
+                        step["status"] = "error"
+                        step["error"] = "selected target missing websocket debugger url"
+                        iterations.append(step)
+                        stop_reason = "error"
+                        break
+
+                    save_attachment(
+                        wfb_home(),
+                        target_id=str(target.get("id", "")),
+                        ws_url=ws_url,
+                        url=str(target.get("url", "")),
+                        title=str(target.get("title", "")),
+                        debug_port=resolved_port,
+                    )
+
+                    try:
+                        inspect_result = inspect_target(
+                            ws_url=ws_url,
+                            max_chars=args.max_chars,
+                        )
+                    except ChromeBridgeError as e:
+                        step["status"] = "error"
+                        step["error"] = f"inspect stage failed: {e}"
+                        iterations.append(step)
+                        stop_reason = "error"
+                        break
+
+                    text_snapshot = str(inspect_result.get("text_snapshot", ""))
+                    page_title = str(inspect_result.get("title", target.get("title", "")))
+                    page_url = str(inspect_result.get("url", target.get("url", "")))
+                    snapshot_chars = int(inspect_result.get("text_snapshot_chars", len(text_snapshot)))
+                    snapshot_truncated = bool(inspect_result.get("text_snapshot_truncated", False))
+
+                    if stability_check and iteration_num > 1 and text_snapshot == prev_snapshot:
+                        step["capture"] = {
+                            "selection": {"method": selection_method, "reason": selection_reason},
+                            "target": {
+                                "id": str(target.get("id", "")),
+                                "title": page_title,
+                                "url": page_url,
+                                "type": str(target.get("type", "")),
+                            },
+                            "snapshot_chars": snapshot_chars,
+                            "snapshot_truncated": snapshot_truncated,
+                            "debug": {"requested_port": int(args.port), "resolved_port": int(resolved_port)},
+                        }
+                        step["status"] = "no_change"
+                        iterations.append(step)
+                        stop_reason = "no_change"
+                        break
+                    prev_snapshot = text_snapshot
+
+                    composed_prompt = _build_bridge_prompt(
+                        user_prompt=args.prompt,
+                        text_snapshot=text_snapshot,
+                        page_title=page_title,
+                        page_url=page_url,
+                        snapshot_chars=snapshot_chars,
+                        snapshot_truncated=snapshot_truncated,
+                    )
+
+                    try:
+                        answer = ask_with_messages(
+                            wfb_home=wfb_home(),
+                            model=model,
+                            messages=[{"role": "user", "text": composed_prompt}],
+                            system=system if isinstance(system, str) else None,
+                        )
+                    except GeminiApiError as e:
+                        step["status"] = "error"
+                        step["error"] = f"ask stage failed: {e}"
+                        iterations.append(step)
+                        stop_reason = "error"
+                        break
+
+                    append_turn(wfb_home(), sid, role="user", text=composed_prompt)
+                    append_turn(wfb_home(), sid, role="model", text=answer)
+
+                    step["capture"] = {
+                        "selection": {"method": selection_method, "reason": selection_reason},
+                        "target": {
+                            "id": str(target.get("id", "")),
+                            "title": page_title,
+                            "url": page_url,
+                            "type": str(target.get("type", "")),
+                        },
+                        "snapshot_chars": snapshot_chars,
+                        "snapshot_truncated": snapshot_truncated,
+                        "debug": {"requested_port": int(args.port), "resolved_port": int(resolved_port)},
+                    }
+                    step["prompt_envelope"] = {
+                        "template_version": BRIDGE_PROMPT_TEMPLATE_VERSION,
+                        "user_prompt": args.prompt,
+                        "composed_prompt_chars": len(composed_prompt),
+                    }
+                    step["gemini_response"] = {
+                        "model": model,
+                        "session_id": sid,
+                        "answer": answer,
+                    }
+                    step["status"] = "continued"
+                    iterations.append(step)
+
+                run_end = _utc_now_iso()
+                last_answer = None
+                for step in reversed(iterations):
+                    resp = step.get("gemini_response")
+                    if isinstance(resp, dict) and isinstance(resp.get("answer"), str):
+                        last_answer = resp["answer"]
+                        break
+
+                payload: dict[str, Any] = {
+                    "run": {
+                        "started_at": run_start,
+                        "ended_at": run_end,
+                        "max_iterations": args.max_iterations,
+                        "iterations_completed": len(iterations),
+                        "stop_reason": stop_reason,
+                    },
+                    "iterations": iterations,
+                    "summary": {
+                        "stop_reason": stop_reason,
+                        "last_answer": last_answer,
+                        "session_id": sid,
+                        "model": model,
+                    },
+                }
+                if args.format == "json":
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    print(f"iterations: {len(iterations)}/{args.max_iterations}")
+                    print(f"stop_reason: {stop_reason}")
+                    print(f"session: {sid}")
+                    print(f"model: {model}")
+                    if last_answer is not None:
+                        print("---")
+                        print(last_answer)
+                return EXIT_OK
+        except (ChromeBridgeError, GeminiApiError, OAuthFlowError) as e:
             _err(str(e))
             return EXIT_IO
 

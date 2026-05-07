@@ -851,6 +851,411 @@ class TestWfb(unittest.TestCase):
             written = "".join(call.args[0] for call in err.write.call_args_list if call.args)
             self.assertIn("next steps:", written)
 
+    def test_bridge_ask_returns_json_with_provenance(self):
+        target = {
+            "id": "t1",
+            "title": "Gemini Chat",
+            "url": "https://gemini.google.com/glic",
+            "type": "webview",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9333/devtools/page/t1",
+        }
+        inspect_result = {
+            "title": "Gemini Chat",
+            "url": "https://gemini.google.com/glic",
+            "text_snapshot": "Hello from Gemini panel",
+            "text_snapshot_chars": 23,
+            "text_snapshot_truncated": False,
+        }
+        fake_session = {
+            "id": "sess_abc",
+            "name": "sess_abc",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9333)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "selected by heuristic ranking")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_active_session_id", return_value="sess_abc"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="The page discusses Gemini features."),
+            mock.patch("wfb.append_turn"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["bridge", "ask", "--prompt", "summarize this page"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["capture"]["selection"]["method"], "heuristic")
+            self.assertEqual(payload["capture"]["target"]["id"], "t1")
+            self.assertEqual(payload["prompt_envelope"]["template_version"], "1")
+            self.assertEqual(payload["prompt_envelope"]["user_prompt"], "summarize this page")
+            self.assertEqual(payload["gemini_response"]["answer"], "The page discusses Gemini features.")
+            self.assertEqual(payload["gemini_response"]["session_id"], "sess_abc")
+
+    def test_bridge_ask_text_format(self):
+        target = {
+            "id": "t2",
+            "title": "Example",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t2",
+        }
+        inspect_result = {
+            "title": "Example",
+            "url": "https://example.test",
+            "text_snapshot": "body text",
+            "text_snapshot_chars": 9,
+            "text_snapshot_truncated": False,
+        }
+        fake_session = {
+            "id": "sess_xyz",
+            "name": "sess_xyz",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "fallback_first", "first candidate")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t2"}),
+            mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_active_session_id", return_value="sess_xyz"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="Short answer."),
+            mock.patch("wfb.append_turn"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["bridge", "ask", "--prompt", "what is this?", "--format", "text"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            self.assertIn("Short answer.", written)
+            self.assertIn("fallback_first", written)
+
+    def test_bridge_ask_capture_failure_reports_stage(self):
+        with (
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch(
+                "wfb._list_targets_with_port_fallback",
+                side_effect=wfb.ChromeBridgeError("connection refused"),
+            ),
+            mock.patch("sys.stderr") as err,
+        ):
+            rc = wfb.main(["bridge", "ask", "--prompt", "test"])
+            self.assertEqual(rc, 5)
+            written = "".join(call.args[0] for call in err.write.call_args_list if call.args)
+            self.assertIn("capture stage failed", written)
+            self.assertIn("next steps:", written)
+
+    def test_bridge_ask_gemini_failure_reports_stage(self):
+        target = {
+            "id": "t1",
+            "title": "Page",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        inspect_result = {
+            "title": "Page",
+            "url": "https://example.test",
+            "text_snapshot": "content",
+            "text_snapshot_chars": 7,
+            "text_snapshot_truncated": False,
+        }
+        fake_session = {
+            "id": "sess_err",
+            "name": "sess_err",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_active_session_id", return_value="sess_err"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", side_effect=wfb.GeminiApiError("503 unavailable")),
+            mock.patch("sys.stderr") as err,
+        ):
+            rc = wfb.main(["bridge", "ask", "--prompt", "summarize"])
+            self.assertEqual(rc, 5)
+            written = "".join(call.args[0] for call in err.write.call_args_list if call.args)
+            self.assertIn("ask stage failed", written)
+
+    def test_bridge_ask_creates_session_when_none_active(self):
+        target = {
+            "id": "t1",
+            "title": "Page",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        inspect_result = {
+            "title": "Page",
+            "url": "https://example.test",
+            "text_snapshot": "content",
+            "text_snapshot_chars": 7,
+            "text_snapshot_truncated": False,
+        }
+        new_session = {
+            "id": "sess_new",
+            "name": "sess_new",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_active_session_id", return_value=None),
+            mock.patch("wfb.load_session", return_value=None),
+            mock.patch("wfb.create_session", return_value=new_session) as create_sess,
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok"),
+            mock.patch("wfb.append_turn"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["bridge", "ask", "--prompt", "test"])
+            self.assertEqual(rc, 0)
+            create_sess.assert_called_once()
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["gemini_response"]["session_id"], "sess_new")
+
+    def test_bridge_loop_runs_max_iterations_and_stops(self):
+        target = {
+            "id": "t1",
+            "title": "Page",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        call_count = 0
+        def _changing_inspect(**kwargs: object) -> dict[str, object]:
+            nonlocal call_count
+            call_count += 1
+            return {
+                "title": "Page",
+                "url": "https://example.test",
+                "text_snapshot": f"content v{call_count}",
+                "text_snapshot_chars": 10,
+                "text_snapshot_truncated": False,
+            }
+        fake_session = {
+            "id": "sess_loop",
+            "name": "sess_loop",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", side_effect=_changing_inspect),
+            mock.patch("wfb.get_active_session_id", return_value="sess_loop"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="answer"),
+            mock.patch("wfb.append_turn"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["bridge", "loop", "--prompt", "check", "--max-iterations", "2"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["run"]["stop_reason"], "max_iterations")
+            self.assertEqual(payload["run"]["iterations_completed"], 2)
+            self.assertEqual(len(payload["iterations"]), 2)
+            self.assertEqual(payload["summary"]["last_answer"], "answer")
+
+    def test_bridge_loop_stability_check_stops_on_no_change(self):
+        target = {
+            "id": "t1",
+            "title": "Page",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        static_inspect = {
+            "title": "Page",
+            "url": "https://example.test",
+            "text_snapshot": "same content",
+            "text_snapshot_chars": 12,
+            "text_snapshot_truncated": False,
+        }
+        fake_session = {
+            "id": "sess_stable",
+            "name": "sess_stable",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=static_inspect),
+            mock.patch("wfb.get_active_session_id", return_value="sess_stable"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="first answer"),
+            mock.patch("wfb.append_turn"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main([
+                    "bridge", "loop", "--prompt", "check",
+                    "--max-iterations", "5", "--stability-check", "on",
+                ])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["run"]["stop_reason"], "no_change")
+            self.assertEqual(payload["run"]["iterations_completed"], 2)
+            self.assertEqual(payload["iterations"][0]["status"], "continued")
+            self.assertEqual(payload["iterations"][1]["status"], "no_change")
+
+    def test_bridge_loop_capture_error_stops_with_error_reason(self):
+        fake_session = {
+            "id": "sess_err",
+            "name": "sess_err",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch(
+                "wfb._list_targets_with_port_fallback",
+                side_effect=wfb.ChromeBridgeError("connection refused"),
+            ),
+            mock.patch("wfb.get_active_session_id", return_value="sess_err"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["bridge", "loop", "--prompt", "check"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["run"]["stop_reason"], "error")
+            self.assertEqual(payload["iterations"][0]["status"], "error")
+            self.assertIn("capture stage failed", payload["iterations"][0]["error"])
+
+    def test_bridge_loop_ask_error_stops_with_error_reason(self):
+        target = {
+            "id": "t1",
+            "title": "Page",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        inspect_result = {
+            "title": "Page",
+            "url": "https://example.test",
+            "text_snapshot": "content",
+            "text_snapshot_chars": 7,
+            "text_snapshot_truncated": False,
+        }
+        fake_session = {
+            "id": "sess_ask_err",
+            "name": "sess_ask_err",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_active_session_id", return_value="sess_ask_err"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", side_effect=wfb.GeminiApiError("503 unavailable")),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["bridge", "loop", "--prompt", "check"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["run"]["stop_reason"], "error")
+            self.assertIn("ask stage failed", payload["iterations"][0]["error"])
+
+    def test_bridge_loop_rejects_invalid_max_iterations(self):
+        rc = wfb.main(["bridge", "loop", "--prompt", "test", "--max-iterations", "0"])
+        self.assertEqual(rc, 2)
+
+    def test_bridge_loop_text_format(self):
+        target = {
+            "id": "t1",
+            "title": "Page",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        inspect_result = {
+            "title": "Page",
+            "url": "https://example.test",
+            "text_snapshot": "body",
+            "text_snapshot_chars": 4,
+            "text_snapshot_truncated": False,
+        }
+        fake_session = {
+            "id": "sess_txt",
+            "name": "sess_txt",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_active_session_id", return_value="sess_txt"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="text answer"),
+            mock.patch("wfb.append_turn"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main([
+                    "bridge", "loop", "--prompt", "go",
+                    "--max-iterations", "1", "--format", "text",
+                ])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            self.assertIn("iterations: 1/1", written)
+            self.assertIn("stop_reason: max_iterations", written)
+            self.assertIn("text answer", written)
+
 
 if __name__ == "__main__":
     unittest.main()

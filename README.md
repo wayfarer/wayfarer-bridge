@@ -206,6 +206,52 @@ Runs discover -> attach -> inspect in one deterministic command.
 - Selection priority: explicit `--target-id`, then focused/active target, then heuristic ranking, then first-candidate fallback.
 - JSON output includes `selection`, `target`, `attachment`, `inspect`, and debug ports (`requested_port`, `resolved_port`).
 
+### `wfb bridge ask --prompt "..." [--session ID] [--model MODEL] [--system TEXT] [--port N] [--target-id ID] [--include-types page,webview] [--gemini-only] [--max-chars N] [--format json|text]`
+
+Runs the full browser-to-Gemini pipeline in one command: capture -> prompt envelope -> Gemini ask.
+
+- Captures browser context via the same logic as `chrome capture`.
+- Builds a versioned prompt envelope embedding the page snapshot and user prompt.
+- Sends the composed prompt to Gemini within the target session (creates one if none active).
+- Appends both the composed prompt and model response to session history.
+
+JSON output includes three provenance sections:
+- `capture`: target selection details, snapshot metadata, debug ports.
+- `prompt_envelope`: template version, original user prompt, composed prompt character count.
+- `gemini_response`: model, session id, full answer text.
+
+Example:
+
+```sh
+wfb bridge ask --prompt "summarize the feedback on this page" --format json
+wfb bridge ask --prompt "extract the test failures" --gemini-only --format text
+```
+
+### `wfb bridge loop --prompt "..." [--max-iterations N] [--stability-check on|off] [--session ID] [--model MODEL] [--system TEXT] [--port N] [--target-id ID] [--include-types page,webview] [--gemini-only] [--max-chars N] [--format json|text]`
+
+Runs a bounded iterative automation loop: each iteration captures browser context and asks Gemini about it.
+
+- `--max-iterations N` (default 3): hard upper bound on iterations.
+- `--stability-check on`: stops early if the page snapshot is unchanged between iterations.
+- Each iteration produces full provenance in the output transcript.
+
+Stop reasons:
+- `max_iterations`: budget exhausted normally.
+- `no_change`: stability check detected identical snapshots.
+- `error`: a capture or ask stage failed (error details in the iteration record).
+
+JSON output includes:
+- `run`: start/end timestamps, iteration budget, stop reason.
+- `iterations[]`: per-step capture, prompt_envelope, gemini_response, and status.
+- `summary`: last answer, session id, model, and stop reason.
+
+Example:
+
+```sh
+wfb bridge loop --prompt "check for new test results" --max-iterations 5 --stability-check on
+wfb bridge loop --prompt "summarize changes" --gemini-only --format text
+```
+
 ## Gemini Sessions For Agents
 
 The Gemini REST calls used by `wfb` do not return a reusable API-managed conversation handle. See `docs/gemini_session_discovery.md` for the discovery notes.

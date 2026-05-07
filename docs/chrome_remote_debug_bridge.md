@@ -46,6 +46,27 @@ Defaults remain backward-compatible: without `--include-types`, `targets`/`attac
 3. Heuristic ranking (prefer non-omnibox targets, then Gemini-signaled targets).
 4. First candidate fallback.
 
+## Bridge workflow
+
+`wfb bridge ask` orchestrates the full pipeline:
+
+```
+capture (discover -> attach -> inspect) -> prompt envelope -> gemini ask -> combined provenance
+```
+
+Each stage reports failures independently (`capture stage failed`, `ask stage failed`) with actionable recovery hints.
+
+`wfb bridge loop` extends this into a bounded iterative pipeline:
+
+```
+for each iteration (up to --max-iterations):
+    capture -> prompt envelope -> gemini ask -> record provenance
+    if --stability-check on and snapshot unchanged: stop(no_change)
+    if error at any stage: stop(error)
+```
+
+Stop reasons are explicit: `max_iterations`, `no_change`, or `error`.
+
 ## Troubleshooting
 
 - If launch fails, pass `--chrome-path` explicitly.
