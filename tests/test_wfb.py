@@ -707,6 +707,57 @@ class TestWfb(unittest.TestCase):
             self.assertEqual(rc, 0)
             inspect_target.assert_called_once()
 
+    def test_chrome_inspect_saved_webview_expands_default_include_types(self):
+        targets = [
+            {
+                "id": "t1",
+                "title": "Gemini Panel",
+                "url": "https://gemini.google.com/glic",
+                "type": "webview",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+            }
+        ]
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page",)),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+                    "debug_port": 9222,
+                    "type": "webview",
+                },
+            ),
+            mock.patch("wfb.list_targets", return_value=targets) as list_targets,
+            mock.patch(
+                "wfb.inspect_target",
+                return_value={"title": "Gemini Panel", "url": "https://gemini.google.com/glic", "text_snapshot": "abc"},
+            ),
+        ):
+            rc = wfb.main(["chrome", "inspect", "--format", "json"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(list_targets.call_args.kwargs["include_types"], ("page", "webview"))
+
+    def test_chrome_inspect_explicit_include_types_takes_precedence(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page",)),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+                    "debug_port": 9222,
+                    "type": "webview",
+                },
+            ),
+            mock.patch("wfb.list_targets", return_value=[]) as list_targets,
+        ):
+            rc = wfb.main(["chrome", "inspect", "--format", "json", "--include-types", "page"])
+            self.assertEqual(rc, 5)
+            self.assertEqual(list_targets.call_args.kwargs["include_types"], ("page",))
+
     def test_chrome_targets_gemini_only_passed(self):
         with (
             mock.patch("wfb.parse_target_types", return_value=("page", "webview")),

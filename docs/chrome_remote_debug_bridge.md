@@ -25,7 +25,9 @@ wfb chrome current
 wfb chrome detach
 ```
 
-Defaults remain backward-compatible: without `--include-types`, `targets`/`attach`/`inspect` resolve page targets only.
+Defaults remain backward-compatible: without `--include-types`, `targets`/`attach` resolve page targets only.
+`inspect` is attachment-aware: when inspecting a persisted attachment, it auto-includes
+the saved attachment type (such as `webview`) unless `--include-types` is explicitly provided.
 
 ## Data flow
 
@@ -72,3 +74,4 @@ Stop reasons are explicit: `max_iterations`, `no_change`, or `error`.
 - If launch fails, pass `--chrome-path` explicitly.
 - If target list is empty, verify Chrome is running with remote debugging enabled on the selected port.
 - If `inspect` reports missing attachment, run `wfb chrome attach --target-id ...` first.
+- If `inspect` still cannot resolve a target, pass explicit `--include-types` to override auto behavior.

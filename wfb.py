@@ -558,6 +558,31 @@ def _list_targets_with_port_fallback(
         raise
 
 
+def _has_flag(argv: list[str], flag: str) -> bool:
+    return any(a == flag or a.startswith(f"{flag}=") for a in argv)
+
+
+def _inspect_effective_types(
+    *,
+    selected_types: tuple[str, ...],
+    include_types_explicit: bool,
+    attachment: dict[str, Any] | None,
+) -> tuple[str, ...]:
+    if include_types_explicit:
+        return selected_types
+    if not isinstance(attachment, dict):
+        return selected_types
+    inferred = attachment.get("type")
+    if not isinstance(inferred, str):
+        return selected_types
+    t = inferred.strip().lower()
+    if t not in ("page", "webview"):
+        return selected_types
+    if t in selected_types:
+        return selected_types
+    return (*selected_types, t)
+
+
 def _build_bridge_prompt(
     *,
     user_prompt: str,
@@ -1538,6 +1563,7 @@ def main(argv: list[str] | None = None) -> int:
                     url=str(target.get("url", "")),
                     title=str(target.get("title", "")),
                     debug_port=args.port,
+                    target_type=str(target.get("type", "")),
                 )
                 if args.format == "json":
                     print(json.dumps(payload, indent=2, sort_keys=True))
@@ -1558,6 +1584,7 @@ def main(argv: list[str] | None = None) -> int:
                 port = args.port
                 targets: list[dict[str, Any]] = []
                 selected_types = parse_target_types(args.include_types)
+                include_types_explicit = _has_flag(argv, "--include-types")
 
                 if target_id:
                     resolved_port = port if port is not None else DEFAULT_DEBUG_PORT
@@ -1589,6 +1616,11 @@ def main(argv: list[str] | None = None) -> int:
                             port = saved_port
                         else:
                             port = DEFAULT_DEBUG_PORT
+                    selected_types = _inspect_effective_types(
+                        selected_types=selected_types,
+                        include_types_explicit=include_types_explicit,
+                        attachment=attachment,
+                    )
                     try:
                         targets = list_targets(port=port, include_types=selected_types)
                     except ChromeBridgeError as e:
@@ -1693,6 +1725,7 @@ def main(argv: list[str] | None = None) -> int:
                     url=str(target.get("url", "")),
                     title=str(target.get("title", "")),
                     debug_port=resolved_port,
+                    target_type=str(target.get("type", "")),
                 )
                 inspect_payload = inspect_target(
                     ws_url=ws_url,
@@ -1933,6 +1966,7 @@ def main(argv: list[str] | None = None) -> int:
                         url=str(target.get("url", "")),
                         title=str(target.get("title", "")),
                         debug_port=resolved_port,
+                        target_type=str(target.get("type", "")),
                     )
 
                     try:

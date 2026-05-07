@@ -22,6 +22,7 @@ def save_attachment(
     url: str,
     title: str,
     debug_port: int,
+    target_type: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "target_id": target_id,
@@ -32,6 +33,8 @@ def save_attachment(
         "attached_at": _now_iso(),
         "mode": "chrome_debug",
     }
+    if isinstance(target_type, str) and target_type:
+        payload["type"] = target_type
     path = chrome_bridge_attachment_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

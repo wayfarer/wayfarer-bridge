@@ -190,6 +190,11 @@ Reads bounded tab context from CDP `Runtime.evaluate` and prints JSON by default
 - `text_snapshot` (bounded/truncated exactly by `--max-chars`)
 - capture metadata (`captured_at_unix`, length fields, target metadata)
 
+Inspect defaults are attachment-aware: when using a persisted attachment and no
+explicit `--include-types` is provided, `wfb` auto-includes the attachment
+target type (for example `webview`) so inspect can resolve saved side-panel
+targets without extra flags.
+
 ### `wfb chrome detach`
 
 Clears the persisted attachment file.
