@@ -10,10 +10,14 @@ import argparse
 import json
 import sqlite3
 import sys
-import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from wfb_oauth import (
+    ensure_client_secret_present,
+    maybe_open_oauth_guide,
+    print_oauth_setup_instructions,
+)
 
 # --- Exit codes (README) ---
 EXIT_OK = 0
@@ -23,7 +27,6 @@ EXIT_DB = 4
 EXIT_IO = 5
 
 DEFAULT_STATUS_LIMIT = 5
-OAUTH_GUIDE_URL = "https://ai.google.dev/gemini-api/docs/oauth"
 
 
 def wfb_home() -> Path:
@@ -34,26 +37,6 @@ def wfb_home() -> Path:
 def default_db_path() -> Path:
     """Default SQLite store path."""
     return wfb_home() / "wayfarer.db"
-
-
-def client_secret_path() -> Path:
-    """Local OAuth desktop client secret location for OSS/PyPI onboarding."""
-    return wfb_home() / "client_secret.json"
-
-
-def _print_oauth_setup_instructions() -> None:
-    secret_path = client_secret_path()
-    print("OAuth setup required for OSS/PyPI build.", file=sys.stderr)
-    print(
-        f"Expected OAuth desktop client secret file at: {secret_path}",
-        file=sys.stderr,
-    )
-    print("Setup steps:", file=sys.stderr)
-    print("  1) Open the Gemini OAuth guide.", file=sys.stderr)
-    print("  2) Create a Desktop OAuth client in your Google Cloud project.", file=sys.stderr)
-    print("  3) Download the JSON and place it at ~/.wfb/client_secret.json.", file=sys.stderr)
-    print(f"Guide: {OAUTH_GUIDE_URL}", file=sys.stderr)
-    print("After placing the file, run: wfb init", file=sys.stderr)
 
 ENVELOPE_KEYS = frozenset(
     {
@@ -760,13 +743,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "init":
         try:
             wfb_home().mkdir(parents=True, exist_ok=True)
-            if not client_secret_path().is_file():
-                _print_oauth_setup_instructions()
-                if not args.no_open_oauth_guide:
-                    try:
-                        webbrowser.open(OAUTH_GUIDE_URL)
-                    except Exception:
-                        pass
+            if not ensure_client_secret_present(wfb_home()):
+                print_oauth_setup_instructions(wfb_home())
+                maybe_open_oauth_guide(args.no_open_oauth_guide)
                 return EXIT_IO
             conn = connect_db(db_path)
             try:
