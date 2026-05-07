@@ -65,6 +65,21 @@ EXIT_DB = 4
 EXIT_IO = 5
 
 DEFAULT_STATUS_LIMIT = 5
+AGENT_WORKFLOW_GUIDANCE = """Agent workflow guidance:
+  1) Initialize once: `wfb init`
+  2) For browser-context capture:
+       - `wfb chrome targets --include-types page,webview --gemini-only`
+       - `wfb chrome attach --target-id <id> --include-types page,webview`
+       - `wfb chrome inspect --include-types page,webview --format json`
+  3) For durable local memory and model control:
+       - create/select session with `wfb gemini session new|use`
+       - run asks with `wfb gemini ask --session <id> ...`
+  4) State ownership:
+       - browser panel text = live context source
+       - local gemini session = durable agent execution history
+  5) Optional persistence:
+       - enable `--sync-world-state on` when chat context should update SQLite world state.
+"""
 
 ENVELOPE_KEYS = frozenset(
     {
@@ -667,7 +682,12 @@ def _load_seed_json(path: Path | None, json_inline: str | None) -> Any:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="wfb", description="Wayfarer Bridge v1 CLI")
+    p = argparse.ArgumentParser(
+        prog="wfb",
+        description="Wayfarer Bridge v1 CLI",
+        epilog=AGENT_WORKFLOW_GUIDANCE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument(
         "--db",
         dest="db",
@@ -722,7 +742,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"preview row cap for text output (default: {DEFAULT_STATUS_LIMIT})",
     )
 
-    gem = sub.add_parser("gemini", help="call Gemini APIs using local OAuth token")
+    gem = sub.add_parser(
+        "gemini",
+        help="call Gemini APIs using local OAuth token",
+        description=(
+            "Gemini API path for deterministic model execution and local state.\n"
+            "Use sessions (`gemini session`) when agents need durable memory."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     gem_sub = gem.add_subparsers(dest="gemini_command", required=True)
 
     ping = gem_sub.add_parser("ping", help="list available Gemini models")
@@ -734,7 +762,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="max model names to print (default: 10)",
     )
 
-    ask = gem_sub.add_parser("ask", help="run a single text prompt")
+    ask = gem_sub.add_parser(
+        "ask",
+        help="run a single text prompt",
+        description=(
+            "Send a prompt with local session continuity.\n"
+            "For agent workflows, prefer explicit `--session` routing.\n"
+            "Browser-panel content can be captured first via `wfb chrome inspect`."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ask.add_argument(
         "--prompt",
         required=True,
@@ -778,7 +815,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="override target world-state DB path for this ask",
     )
 
-    sess = gem_sub.add_parser("session", help="manage local Gemini chat sessions")
+    sess = gem_sub.add_parser(
+        "session",
+        help="manage local Gemini chat sessions",
+        description=(
+            "Manage durable local session state used by `wfb gemini ask`.\n"
+            "Use `new`/`use` to avoid accidental cross-task history mixing."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sess_sub = sess.add_subparsers(dest="gemini_session_command", required=True)
     sess_sub.add_parser("current", help="show active session id")
     sess_sub.add_parser("list", help="list local sessions")
@@ -810,7 +855,15 @@ def build_parser() -> argparse.ArgumentParser:
     insp.add_argument("--id", help="session id (defaults to active session)")
     insp.add_argument("--format", choices=("text", "json"), default="text")
 
-    chrome = sub.add_parser("chrome", help="Chrome remote debugging bridge commands")
+    chrome = sub.add_parser(
+        "chrome",
+        help="Chrome remote debugging bridge commands",
+        description=(
+            "Browser-context capture path.\n"
+            "Use `--include-types page,webview` to include Gemini side-panel targets."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     chrome_sub = chrome.add_subparsers(dest="chrome_command", required=True)
 
     c_launch = chrome_sub.add_parser("launch", help="launch or verify debuggable Chrome")
