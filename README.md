@@ -46,11 +46,25 @@ This document freezes **v1** so implementation can proceed without reinterpretat
 - Calls Gemini REST models endpoint and prints model count + names.
 - Useful as an authenticated connectivity smoke test.
 
-### `wfb gemini ask --prompt STRING [--model ID]`
+### `wfb gemini ask --prompt STRING [--model ID] [--session ID] [--max-history-turns N] [--system TEXT]`
 
-- Sends one text prompt to Gemini via REST (`generateContent`).
-- Prints plain text output only (no streaming in this phase).
+- Uses local hybrid session memory by default:
+  - active session is used implicitly,
+  - if none exists, one is auto-created.
+- Appends user and model turns to local session history.
+- Sends history (bounded by `--max-history-turns`) to Gemini `generateContent`.
+- `--session` explicitly routes one ask to a specific local session.
+- `--system` overrides system instruction for the current call.
 - Default model: `gemini-2.5-flash`.
+
+### `wfb gemini session ...`
+
+- `wfb gemini session current` shows the active session id.
+- `wfb gemini session list` lists all local sessions (`*` marks active).
+- `wfb gemini session new [--name ...] [--model ...] [--system ...]` creates + activates.
+- `wfb gemini session use --id ...` activates an existing session.
+- `wfb gemini session reset [--id ...]` clears only that session's turn history.
+- `wfb gemini session inspect [--id ...] [--format text|json]` inspects a session.
 
 Optional future commands (`export`, `validate`) remain out of scope for this stage.
 
@@ -83,6 +97,20 @@ Troubleshooting:
 - For headless/manual environments, run `wfb init --no-browser`.
 - If API calls fail after some time due to token refresh issues, rerun `wfb init --force-login` to refresh local credentials.
 - In testing-mode OAuth projects, `refresh_token_expires_in` may be short (e.g. about 7 days), which requires periodic re-login.
+
+---
+
+## Gemini Sessions For Agents
+
+API-managed reusable conversation handles are currently treated as unsupported in `wfb`'s active Gemini REST surface; see `docs/gemini_session_discovery.md`.
+
+Agent-first workflow:
+
+1. `wfb gemini session new --name planning`
+2. `wfb gemini ask --prompt "first prompt"`
+3. `wfb gemini ask --prompt "follow-up prompt"` (same context by default)
+4. `wfb gemini session inspect --format json` (deterministic state for orchestration)
+5. `wfb gemini session reset` when you want a clean context window
 
 ---
 

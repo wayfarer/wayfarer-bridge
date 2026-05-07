@@ -14,7 +14,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from wfb_db import UPDATED_AT_SQL, connect_db, init_db, require_v1_schema
-from wfb_gemini_api import DEFAULT_MODEL, GeminiApiError, ask_text, list_models
+from wfb_gemini_api import (
+    DEFAULT_MODEL,
+    GeminiApiError,
+    api_managed_state_supported,
+    ask_with_messages,
+    list_models,
+)
+from wfb_gemini_sessions import (
+    append_turn,
+    create_session,
+    get_active_session_id,
+    list_sessions,
+    load_session,
+    reset_session,
+    save_session,
+    set_active_session,
+)
 from wfb_oauth import (
     ensure_client_secret_present,
     ensure_logged_in,
@@ -680,6 +696,34 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MODEL,
         help=f"model id (default: {DEFAULT_MODEL})",
     )
+    ask.add_argument("--session", help="optional session id; defaults to active session")
+    ask.add_argument(
+        "--max-history-turns",
+        type=int,
+        default=30,
+        metavar="N",
+        help="max historical turns to include (default: 30)",
+    )
+    ask.add_argument(
+        "--system",
+        help="optional session-level system instruction override for this call",
+    )
+
+    sess = gem_sub.add_parser("session", help="manage local Gemini chat sessions")
+    sess_sub = sess.add_subparsers(dest="gemini_session_command", required=True)
+    sess_sub.add_parser("current", help="show active session id")
+    sess_sub.add_parser("list", help="list local sessions")
+    newp = sess_sub.add_parser("new", help="create and select a new session")
+    newp.add_argument("--name", help="optional human-readable session name")
+    newp.add_argument("--model", default=DEFAULT_MODEL, help=f"default model (default: {DEFAULT_MODEL})")
+    newp.add_argument("--system", help="optional default system instruction")
+    usep = sess_sub.add_parser("use", help="select an existing session as active")
+    usep.add_argument("--id", required=True, help="session id")
+    resetp = sess_sub.add_parser("reset", help="clear session message history")
+    resetp.add_argument("--id", help="session id (defaults to active session)")
+    insp = sess_sub.add_parser("inspect", help="print session record")
+    insp.add_argument("--id", help="session id (defaults to active session)")
+    insp.add_argument("--format", choices=("text", "json"), default="text")
     p.set_defaults(
         file=None,
         json_data=None,
@@ -736,13 +780,128 @@ def main(argv: list[str] | None = None) -> int:
                 return EXIT_OK
 
             if args.gemini_command == "ask":
-                answer = ask_text(
+                if args.max_history_turns < 0:
+                    _err("--max-history-turns must be non-negative")
+                    return EXIT_USAGE
+
+                sid = args.session or get_active_session_id(wfb_home())
+                if sid:
+                    sess = load_session(wfb_home(), sid)
+                else:
+                    sess = None
+                if sess is None:
+                    sess = create_session(
+                        wfb_home(),
+                        name=None,
+                        model=args.model,
+                        system=args.system,
+                    )
+                    sid = str(sess["id"])
+                assert sid is not None
+                set_active_session(wfb_home(), sid)
+
+                model = args.model or str(sess.get("model", DEFAULT_MODEL))
+                if model != sess.get("model"):
+                    sess["model"] = model
+                    save_session(wfb_home(), sess)
+                system = args.system if args.system is not None else sess.get("system")
+
+                history = sess.get("messages", [])
+                if not isinstance(history, list):
+                    history = []
+                trimmed = history[-args.max_history_turns :] if args.max_history_turns else []
+                normalized: list[dict[str, str]] = []
+                for t in trimmed:
+                    if isinstance(t, dict) and isinstance(t.get("role"), str) and isinstance(
+                        t.get("text"), str
+                    ):
+                        normalized.append({"role": t["role"], "text": t["text"]})
+                normalized.append({"role": "user", "text": args.prompt})
+
+                answer = ask_with_messages(
                     wfb_home=wfb_home(),
-                    prompt=args.prompt,
-                    model=args.model,
+                    model=model,
+                    messages=normalized,
+                    system=system if isinstance(system, str) else None,
                 )
+                append_turn(wfb_home(), sid, role="user", text=args.prompt)
+                append_turn(wfb_home(), sid, role="model", text=answer)
                 print(answer)
                 return EXIT_OK
+
+            if args.gemini_command == "session":
+                if args.gemini_session_command == "current":
+                    current = get_active_session_id(wfb_home())
+                    if current is None:
+                        print("No active session.")
+                    else:
+                        print(current)
+                    st = api_managed_state_supported()
+                    if not st.get("supported"):
+                        print(f"api_managed_state_supported: no ({st.get('reason')})")
+                    return EXIT_OK
+
+                if args.gemini_session_command == "list":
+                    sessions = list_sessions(wfb_home())
+                    active = get_active_session_id(wfb_home())
+                    if not sessions:
+                        print("No local sessions.")
+                        return EXIT_OK
+                    for s in sessions:
+                        sid = str(s.get("id", ""))
+                        marker = "*" if sid == active else " "
+                        name = str(s.get("name", sid))
+                        model = str(s.get("model", DEFAULT_MODEL))
+                        print(f"{marker} {sid}\t{name}\tmodel={model}")
+                    return EXIT_OK
+
+                if args.gemini_session_command == "new":
+                    sess = create_session(
+                        wfb_home(),
+                        name=args.name,
+                        model=args.model,
+                        system=args.system,
+                    )
+                    print(str(sess["id"]))
+                    return EXIT_OK
+
+                if args.gemini_session_command == "use":
+                    if load_session(wfb_home(), args.id) is None:
+                        _err(f"session not found: {args.id}")
+                        return EXIT_IO
+                    set_active_session(wfb_home(), args.id)
+                    print(args.id)
+                    return EXIT_OK
+
+                if args.gemini_session_command == "reset":
+                    sid = args.id or get_active_session_id(wfb_home())
+                    if not sid:
+                        _err("no active session")
+                        return EXIT_IO
+                    if reset_session(wfb_home(), sid) is None:
+                        _err(f"session not found: {sid}")
+                        return EXIT_IO
+                    print(f"reset {sid}")
+                    return EXIT_OK
+
+                if args.gemini_session_command == "inspect":
+                    sid = args.id or get_active_session_id(wfb_home())
+                    if not sid:
+                        _err("no active session")
+                        return EXIT_IO
+                    sess = load_session(wfb_home(), sid)
+                    if sess is None:
+                        _err(f"session not found: {sid}")
+                        return EXIT_IO
+                    if args.format == "json":
+                        print(json.dumps(sess, indent=2, sort_keys=True))
+                    else:
+                        print(f"id: {sess.get('id')}")
+                        print(f"name: {sess.get('name')}")
+                        print(f"model: {sess.get('model')}")
+                        msgs = sess.get("messages", [])
+                        print(f"messages: {len(msgs) if isinstance(msgs, list) else 0}")
+                    return EXIT_OK
         except (GeminiApiError, OAuthFlowError) as e:
             _err(str(e))
             return EXIT_IO

@@ -308,13 +308,47 @@ class TestWfb(unittest.TestCase):
     def test_gemini_ask_prints_response(self):
         with (
             mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
-            mock.patch("wfb.ask_text", return_value="hello from gemini"),
+            mock.patch(
+                "wfb.load_session",
+                return_value={
+                    "id": "sess_1",
+                    "name": "sess_1",
+                    "model": "gemini-2.5-flash",
+                    "messages": [],
+                },
+            ),
+            mock.patch("wfb.get_active_session_id", return_value="sess_1"),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.append_turn"),
+            mock.patch("wfb.ask_with_messages", return_value="hello from gemini"),
         ):
             with mock.patch("sys.stdout") as out:
                 rc = wfb.main(["gemini", "ask", "--prompt", "hello"])
             self.assertEqual(rc, 0)
             written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
             self.assertIn("hello from gemini", written)
+
+    def test_gemini_session_new_use_inspect_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td)
+            sess = {
+                "id": "sess_abc",
+                "name": "demo",
+                "model": "gemini-2.5-flash",
+                "messages": [],
+            }
+            with (
+                mock.patch("wfb.wfb_home", return_value=fake_home),
+                mock.patch("wfb.create_session", return_value=sess),
+                mock.patch("wfb.load_session", return_value=sess),
+                mock.patch("wfb.set_active_session"),
+            ):
+                rc_new = wfb.main(["gemini", "session", "new", "--name", "demo"])
+                self.assertEqual(rc_new, 0)
+                rc_use = wfb.main(["gemini", "session", "use", "--id", "sess_abc"])
+                self.assertEqual(rc_use, 0)
+                rc_inspect = wfb.main(["gemini", "session", "inspect", "--id", "sess_abc", "--format", "json"])
+                self.assertEqual(rc_inspect, 0)
 
 
 if __name__ == "__main__":

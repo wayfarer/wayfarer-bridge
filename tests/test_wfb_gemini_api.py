@@ -106,6 +106,33 @@ class TestWfbGeminiApi(unittest.TestCase):
                     api.ask_text(wfb_home=home, prompt="hello")
             self.assertIn("missing candidates", str(ctx.exception))
 
+    def test_ask_with_messages_sends_history_and_system(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            payload = {
+                "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+            }
+            with mock.patch(
+                "wfb_gemini_api.load_token",
+                return_value={"access_token": "abc", "expires_at": int(time.time()) + 3600},
+            ), mock.patch("wfb_gemini_api.urlopen", return_value=_Resp(payload)):
+                out = api.ask_with_messages(
+                    wfb_home=home,
+                    model="gemini-2.5-flash",
+                    messages=[
+                        {"role": "user", "text": "hi"},
+                        {"role": "model", "text": "hello"},
+                        {"role": "user", "text": "again"},
+                    ],
+                    system="be concise",
+                )
+            self.assertEqual(out, "ok")
+
+    def test_api_managed_state_supported_false(self):
+        state = api.api_managed_state_supported()
+        self.assertFalse(state["supported"])
+        self.assertIn("generateContent", state["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

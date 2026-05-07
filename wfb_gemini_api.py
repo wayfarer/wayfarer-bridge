@@ -147,15 +147,34 @@ def list_models(*, wfb_home: Path) -> list[str]:
 
 
 def ask_text(*, wfb_home: Path, prompt: str, model: str = DEFAULT_MODEL) -> str:
+    return ask_with_messages(
+        wfb_home=wfb_home,
+        model=model,
+        messages=[{"role": "user", "text": prompt}],
+        system=None,
+    )
+
+
+def ask_with_messages(
+    *,
+    wfb_home: Path,
+    model: str,
+    messages: list[dict[str, str]],
+    system: str | None,
+) -> str:
     access_token = _get_access_token(wfb_home)
+    contents = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        text = msg.get("text", "")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        contents.append({"role": role, "parts": [{"text": text}]})
     payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ]
+        "contents": contents
     }
+    if system:
+        payload["systemInstruction"] = {"parts": [{"text": system}]}
     data = _request_json(
         method="POST",
         url=f"{GEMINI_API_BASE}/v1beta/models/{model}:generateContent",
@@ -178,3 +197,16 @@ def ask_text(*, wfb_home: Path, prompt: str, model: str = DEFAULT_MODEL) -> str:
         if isinstance(part, dict) and isinstance(part.get("text"), str):
             return part["text"]
     raise GeminiApiError("generation response did not contain text output")
+
+
+def api_managed_state_supported() -> dict[str, object]:
+    """
+    Current public REST usage provides no stable conversation/session handle fields.
+
+    This function exposes the decision-gate result for CLI/docs.
+    """
+    return {
+        "supported": False,
+        "reason": "Public Gemini REST generateContent/list models paths do not expose reusable chat session handles in this client surface.",
+        "evidence": ["v1/models", "v1beta/models/{model}:generateContent"],
+    }
