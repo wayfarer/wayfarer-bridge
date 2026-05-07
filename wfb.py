@@ -20,15 +20,19 @@ from wfb_gemini_api import (
     api_managed_state_supported,
     ask_with_messages,
     list_models,
+    summarization_policy_for_model,
+    summarize_messages,
 )
 from wfb_gemini_sessions import (
     append_turn,
+    compacted_session_copy,
     create_session,
     get_active_session_id,
     list_sessions,
     load_session,
     reset_session,
     save_session,
+    session_message_stats,
     set_active_session,
 )
 from wfb_oauth import (
@@ -708,6 +712,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--system",
         help="optional session-level system instruction override for this call",
     )
+    ask.add_argument(
+        "--auto-summarize",
+        choices=("on", "off"),
+        default="off",
+        help="auto-compact long session history before ask (default: off)",
+    )
+    ask.add_argument(
+        "--summarize-model",
+        help="optional model override used only for history summarization",
+    )
 
     sess = gem_sub.add_parser("session", help="manage local Gemini chat sessions")
     sess_sub = sess.add_subparsers(dest="gemini_session_command", required=True)
@@ -809,13 +823,64 @@ def main(argv: list[str] | None = None) -> int:
                 history = sess.get("messages", [])
                 if not isinstance(history, list):
                     history = []
-                trimmed = history[-args.max_history_turns :] if args.max_history_turns else []
+                pending_compacted: dict[str, Any] | None = None
+
+                if args.auto_summarize == "on":
+                    policy = summarization_policy_for_model(model)
+                    stats = session_message_stats(sess)
+                    max_turns = int(policy["max_turns"])
+                    max_chars = int(policy["max_chars"])
+                    keep_recent_turns = int(policy["keep_recent_turns"])
+                    should_compact = stats["turns"] > max_turns or stats["chars"] > max_chars
+                    if should_compact:
+                        summarize_model = args.summarize_model or model
+                        if keep_recent_turns >= len(history):
+                            keep_recent_turns = max(1, len(history) // 2)
+                        older: list[dict[str, str]] = []
+                        for t in history[: max(0, len(history) - keep_recent_turns)]:
+                            if isinstance(t, dict) and isinstance(t.get("role"), str) and isinstance(
+                                t.get("text"), str
+                            ):
+                                older.append({"role": t["role"], "text": t["text"]})
+                        if older:
+                            summary = summarize_messages(
+                                wfb_home=wfb_home(),
+                                model=summarize_model,
+                                messages=older,
+                            )
+                            updated = compacted_session_copy(
+                                sess,
+                                summary_text=summary,
+                                source_model=summarize_model,
+                                keep_recent_turns=keep_recent_turns,
+                            )
+                            pending_compacted = updated
+                            sess = updated
+                            history = sess.get("messages", [])
+                            if not isinstance(history, list):
+                                history = []
+
+                summary_msgs: list[dict[str, str]] = []
+                non_summary_msgs: list[dict[str, str]] = []
+                for t in history:
+                    if not (isinstance(t, dict) and isinstance(t.get("role"), str) and isinstance(t.get("text"), str)):
+                        continue
+                    role = t["role"]
+                    if role == "system":
+                        # Backward compatibility for earlier summary artifacts.
+                        role = "model"
+                    normalized_turn = {"role": role, "text": t["text"]}
+                    if t.get("kind") == "history_summary":
+                        summary_msgs.append(normalized_turn)
+                    else:
+                        non_summary_msgs.append(normalized_turn)
+
+                trimmed_non_summary = (
+                    non_summary_msgs[-args.max_history_turns :] if args.max_history_turns else []
+                )
                 normalized: list[dict[str, str]] = []
-                for t in trimmed:
-                    if isinstance(t, dict) and isinstance(t.get("role"), str) and isinstance(
-                        t.get("text"), str
-                    ):
-                        normalized.append({"role": t["role"], "text": t["text"]})
+                normalized.extend(summary_msgs)
+                normalized.extend(trimmed_non_summary)
                 normalized.append({"role": "user", "text": args.prompt})
 
                 answer = ask_with_messages(
@@ -824,6 +889,8 @@ def main(argv: list[str] | None = None) -> int:
                     messages=normalized,
                     system=system if isinstance(system, str) else None,
                 )
+                if pending_compacted is not None:
+                    save_session(wfb_home(), pending_compacted)
                 append_turn(wfb_home(), sid, role="user", text=args.prompt)
                 append_turn(wfb_home(), sid, role="model", text=answer)
                 print(answer)
@@ -901,6 +968,12 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"model: {sess.get('model')}")
                         msgs = sess.get("messages", [])
                         print(f"messages: {len(msgs) if isinstance(msgs, list) else 0}")
+                        if isinstance(msgs, list):
+                            summary_count = 0
+                            for m in msgs:
+                                if isinstance(m, dict) and m.get("kind") == "history_summary":
+                                    summary_count += 1
+                            print(f"summaries: {summary_count}")
                     return EXIT_OK
         except (GeminiApiError, OAuthFlowError) as e:
             _err(str(e))

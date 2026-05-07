@@ -350,6 +350,191 @@ class TestWfb(unittest.TestCase):
                 rc_inspect = wfb.main(["gemini", "session", "inspect", "--id", "sess_abc", "--format", "json"])
                 self.assertEqual(rc_inspect, 0)
 
+    def test_gemini_ask_triggers_summarization(self):
+        long_messages = [{"role": "user", "text": f"m{i}"} for i in range(50)]
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch(
+                "wfb.load_session",
+                return_value={
+                    "id": "sess_1",
+                    "name": "sess_1",
+                    "model": "gemini-2.5-flash",
+                    "messages": long_messages,
+                },
+            ),
+            mock.patch("wfb.get_active_session_id", return_value="sess_1"),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.session_message_stats", return_value={"turns": 50, "chars": 5000}),
+            mock.patch(
+                "wfb.summarization_policy_for_model",
+                return_value={"max_turns": 40, "max_chars": 4000, "keep_recent_turns": 10},
+            ),
+            mock.patch("wfb.summarize_messages", return_value="summary") as summarize,
+            mock.patch(
+                "wfb.compacted_session_copy",
+                return_value={
+                    "id": "sess_1",
+                    "name": "sess_1",
+                    "model": "gemini-2.5-flash",
+                    "messages": [{"role": "model", "kind": "history_summary", "text": "summary"}],
+                },
+            ),
+            mock.patch("wfb.save_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok"),
+            mock.patch("wfb.append_turn"),
+        ):
+            rc = wfb.main(["gemini", "ask", "--prompt", "hello", "--auto-summarize", "on"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(summarize.called)
+
+    def test_gemini_ask_summarization_failure_hard_fails(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch(
+                "wfb.load_session",
+                return_value={
+                    "id": "sess_1",
+                    "name": "sess_1",
+                    "model": "gemini-2.5-flash",
+                    "messages": [{"role": "user", "text": "m"}] * 50,
+                },
+            ),
+            mock.patch("wfb.get_active_session_id", return_value="sess_1"),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.session_message_stats", return_value={"turns": 50, "chars": 5000}),
+            mock.patch(
+                "wfb.summarization_policy_for_model",
+                return_value={"max_turns": 40, "max_chars": 4000, "keep_recent_turns": 10},
+            ),
+            mock.patch("wfb.summarize_messages", side_effect=wfb.GeminiApiError("summary failed")),
+        ):
+            rc = wfb.main(["gemini", "ask", "--prompt", "hello", "--auto-summarize", "on"])
+            self.assertEqual(rc, 5)
+
+    def test_gemini_ask_default_auto_summarize_is_off(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch(
+                "wfb.load_session",
+                return_value={
+                    "id": "sess_1",
+                    "name": "sess_1",
+                    "model": "gemini-2.5-flash",
+                    "messages": [{"role": "user", "text": "m"}] * 500,
+                },
+            ),
+            mock.patch("wfb.get_active_session_id", return_value="sess_1"),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok"),
+            mock.patch("wfb.append_turn"),
+            mock.patch("wfb.summarize_messages") as summarize,
+        ):
+            rc = wfb.main(["gemini", "ask", "--prompt", "hello"])
+            self.assertEqual(rc, 0)
+            self.assertFalse(summarize.called)
+
+    def test_gemini_ask_failure_after_summary_does_not_save_compacted(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch(
+                "wfb.load_session",
+                return_value={
+                    "id": "sess_1",
+                    "name": "sess_1",
+                    "model": "gemini-2.5-flash",
+                    "messages": [{"role": "user", "text": "m"}] * 200,
+                },
+            ),
+            mock.patch("wfb.get_active_session_id", return_value="sess_1"),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.session_message_stats", return_value={"turns": 200, "chars": 250000}),
+            mock.patch(
+                "wfb.summarization_policy_for_model",
+                return_value={"max_turns": 160, "max_chars": 200000, "keep_recent_turns": 50},
+            ),
+            mock.patch("wfb.summarize_messages", return_value="summary"),
+            mock.patch(
+                "wfb.compacted_session_copy",
+                return_value={"id": "sess_1", "messages": [{"role": "model", "text": "summary", "kind": "history_summary"}]},
+            ),
+            mock.patch("wfb.ask_with_messages", side_effect=wfb.GeminiApiError("unavailable")),
+            mock.patch("wfb.save_session") as save_session,
+            mock.patch("wfb.append_turn"),
+        ):
+            rc = wfb.main(["gemini", "ask", "--prompt", "hello", "--auto-summarize", "on"])
+            self.assertEqual(rc, 5)
+            self.assertFalse(save_session.called)
+
+    def test_gemini_ask_always_includes_summary_when_trimming(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch(
+                "wfb.load_session",
+                return_value={
+                    "id": "sess_1",
+                    "name": "sess_1",
+                    "model": "gemini-2.5-flash",
+                    "messages": [
+                        {"role": "model", "kind": "history_summary", "text": "summary"},
+                        *[{"role": "user", "text": f"m{i}"} for i in range(60)],
+                    ],
+                },
+            ),
+            mock.patch("wfb.get_active_session_id", return_value="sess_1"),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok") as ask_call,
+            mock.patch("wfb.append_turn"),
+        ):
+            rc = wfb.main(["gemini", "ask", "--prompt", "hello", "--max-history-turns", "5"])
+            self.assertEqual(rc, 0)
+            sent_messages = ask_call.call_args.kwargs["messages"]
+            self.assertEqual(sent_messages[0]["text"], "summary")
+
+    def test_gemini_ask_normalizes_legacy_system_role(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch(
+                "wfb.load_session",
+                return_value={
+                    "id": "sess_1",
+                    "name": "sess_1",
+                    "model": "gemini-2.5-flash",
+                    "messages": [{"role": "system", "text": "legacy summary"}],
+                },
+            ),
+            mock.patch("wfb.get_active_session_id", return_value="sess_1"),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok") as ask_call,
+            mock.patch("wfb.append_turn"),
+        ):
+            rc = wfb.main(["gemini", "ask", "--prompt", "hello", "--max-history-turns", "5"])
+            self.assertEqual(rc, 0)
+            sent_messages = ask_call.call_args.kwargs["messages"]
+            self.assertEqual(sent_messages[0]["role"], "model")
+
+    def test_gemini_ask_auto_summarize_off(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch(
+                "wfb.load_session",
+                return_value={
+                    "id": "sess_1",
+                    "name": "sess_1",
+                    "model": "gemini-2.5-flash",
+                    "messages": [{"role": "user", "text": "m"}] * 50,
+                },
+            ),
+            mock.patch("wfb.get_active_session_id", return_value="sess_1"),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok"),
+            mock.patch("wfb.append_turn"),
+            mock.patch("wfb.summarize_messages") as summarize,
+        ):
+            rc = wfb.main(["gemini", "ask", "--prompt", "hello", "--auto-summarize", "off"])
+            self.assertEqual(rc, 0)
+            self.assertFalse(summarize.called)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,22 @@ class GeminiApiError(Exception):
     """Raised when a Gemini API request or token refresh fails."""
 
 
+def summarization_policy_for_model(model: str) -> dict[str, object]:
+    """
+    Heuristic model-aware compaction policy for drift prevention.
+    This is not a hard context-window limit; it intentionally compacts only
+    at very long histories to reduce quality drift across many turns.
+    """
+    m = model.lower()
+    if "flash-lite" in m:
+        return {"max_turns": 120, "max_chars": 180000, "keep_recent_turns": 48}
+    if "flash" in m:
+        return {"max_turns": 160, "max_chars": 260000, "keep_recent_turns": 64}
+    if "pro" in m:
+        return {"max_turns": 220, "max_chars": 360000, "keep_recent_turns": 88}
+    return {"max_turns": 140, "max_chars": 220000, "keep_recent_turns": 56}
+
+
 def _token_error_hint(msg: str) -> GeminiApiError:
     return GeminiApiError(f"{msg}. Run `wfb init --force-login` to re-authenticate.")
 
@@ -197,6 +213,44 @@ def ask_with_messages(
         if isinstance(part, dict) and isinstance(part.get("text"), str):
             return part["text"]
     raise GeminiApiError("generation response did not contain text output")
+
+
+def summarize_messages(
+    *,
+    wfb_home: Path,
+    model: str,
+    messages: list[dict[str, str]],
+) -> str:
+    """
+    Generate a compact summary for historical turns.
+    Raises GeminiApiError on empty/malformed summarization output.
+    """
+    if not messages:
+        raise GeminiApiError("cannot summarize empty message list")
+    prompt_lines = [
+        "Summarize the following prior conversation turns for memory compaction.",
+        "Return plain text only.",
+        "Preserve exact details when present: file paths, commands, errors, decisions, constraints, TODOs, IDs, and quoted strings.",
+        "Use compact sections with prefixes: GOALS:, CONSTRAINTS:, DECISIONS:, OPEN_QUESTIONS:, KEY_DETAILS:.",
+        "Avoid markdown and avoid inventing details.",
+        "",
+    ]
+    for i, msg in enumerate(messages, start=1):
+        role = msg.get("role", "user")
+        text = msg.get("text", "")
+        if isinstance(text, str) and text.strip():
+            prompt_lines.append(f"{i}. {role}: {text}")
+    summary_prompt = "\n".join(prompt_lines)
+    out = ask_with_messages(
+        wfb_home=wfb_home,
+        model=model,
+        messages=[{"role": "user", "text": summary_prompt}],
+        system="You are a precise conversation summarizer for AI memory compaction.",
+    )
+    normalized = out.strip()
+    if not normalized:
+        raise GeminiApiError("summarization response was empty")
+    return normalized
 
 
 def api_managed_state_supported() -> dict[str, object]:

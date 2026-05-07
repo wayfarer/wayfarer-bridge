@@ -40,6 +40,48 @@ class TestWfbGeminiSessions(unittest.TestCase):
             assert reset is not None
             self.assertEqual(reset["messages"], [])
 
+    def test_session_stats_and_compaction(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            created = sessions.create_session(home, name=None, model="gemini-2.5-flash", system=None)
+            sid = str(created["id"])
+            for i in range(6):
+                sessions.append_turn(home, sid, role="user" if i % 2 == 0 else "model", text=f"msg{i}")
+            sess = sessions.load_session(home, sid)
+            assert sess is not None
+            stats = sessions.session_message_stats(sess)
+            self.assertEqual(stats["turns"], 6)
+            compacted = sessions.compact_session_history(
+                home,
+                session_id=sid,
+                summary_text="summary",
+                source_model="gemini-2.5-flash",
+                keep_recent_turns=2,
+            )
+            assert compacted is not None
+            msgs = compacted["messages"]
+            self.assertEqual(msgs[0]["kind"], "history_summary")
+            self.assertEqual(msgs[0]["summary_meta"]["covered_turn_count"], 4)
+            self.assertEqual(len(msgs), 3)
+
+    def test_compacted_session_copy_does_not_mutate_original(self):
+        original = {
+            "id": "sess_x",
+            "messages": [
+                {"role": "user", "text": "a"},
+                {"role": "model", "text": "b"},
+                {"role": "user", "text": "c"},
+            ],
+        }
+        compacted = sessions.compacted_session_copy(
+            original,
+            summary_text="summary",
+            source_model="gemini-2.5-flash",
+            keep_recent_turns=1,
+        )
+        self.assertEqual(len(original["messages"]), 3)
+        self.assertEqual(compacted["messages"][0]["kind"], "history_summary")
+
 
 if __name__ == "__main__":
     unittest.main()

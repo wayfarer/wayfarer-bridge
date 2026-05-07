@@ -46,7 +46,7 @@ This document freezes **v1** so implementation can proceed without reinterpretat
 - Calls Gemini REST models endpoint and prints model count + names.
 - Useful as an authenticated connectivity smoke test.
 
-### `wfb gemini ask --prompt STRING [--model ID] [--session ID] [--max-history-turns N] [--system TEXT]`
+### `wfb gemini ask --prompt STRING [--model ID] [--session ID] [--max-history-turns N] [--system TEXT] [--auto-summarize on|off] [--summarize-model ID]`
 
 - Uses local hybrid session memory by default:
   - active session is used implicitly,
@@ -55,6 +55,8 @@ This document freezes **v1** so implementation can proceed without reinterpretat
 - Sends history (bounded by `--max-history-turns`) to Gemini `generateContent`.
 - `--session` explicitly routes one ask to a specific local session.
 - `--system` overrides system instruction for the current call.
+- `--auto-summarize on|off` controls model-based pre-ask compaction (default: `off`).
+- `--summarize-model` optionally uses a different Gemini model specifically for summary generation.
 - Default model: `gemini-2.5-flash`.
 
 ### `wfb gemini session ...`
@@ -111,6 +113,15 @@ Agent-first workflow:
 3. `wfb gemini ask --prompt "follow-up prompt"` (same context by default)
 4. `wfb gemini session inspect --format json` (deterministic state for orchestration)
 5. `wfb gemini session reset` when you want a clean context window
+
+### Session Summarization
+
+- Long sessions can be compacted before `ask` using a Gemini-generated summary (`--auto-summarize on`).
+- Trigger thresholds are model-aware drift heuristics (`flash-lite`, `flash`, `pro`, fallback policy), not hard context-window limits.
+- Compaction preserves recent turns and replaces older turns with a `history_summary` message.
+- No deterministic fallback is used.
+- If compaction is required and summary generation fails, `wfb gemini ask` fails with an error (hard-fail).
+- Safety behavior: compacted state is only persisted after the final ask succeeds, so transient failures do not overwrite raw history.
 
 ---
 

@@ -124,3 +124,72 @@ def append_turn(
     msgs.append({"role": role, "text": text, "ts": _now_iso()})
     save_session(wfb_home, sess)
     return sess
+
+
+def session_message_stats(session: dict[str, Any]) -> dict[str, int]:
+    messages = session.get("messages")
+    if not isinstance(messages, list):
+        return {"turns": 0, "chars": 0}
+    turns = 0
+    chars = 0
+    for m in messages:
+        if isinstance(m, dict) and isinstance(m.get("text"), str):
+            turns += 1
+            chars += len(m["text"])
+    return {"turns": turns, "chars": chars}
+
+
+def compact_session_history(
+    wfb_home: Path,
+    *,
+    session_id: str,
+    summary_text: str,
+    source_model: str,
+    keep_recent_turns: int,
+) -> dict[str, Any] | None:
+    sess = load_session(wfb_home, session_id)
+    if sess is None:
+        return None
+    compacted = compacted_session_copy(
+        sess,
+        summary_text=summary_text,
+        source_model=source_model,
+        keep_recent_turns=keep_recent_turns,
+    )
+    save_session(wfb_home, compacted)
+    return compacted
+
+
+def compacted_session_copy(
+    session: dict[str, Any],
+    *,
+    summary_text: str,
+    source_model: str,
+    keep_recent_turns: int,
+) -> dict[str, Any]:
+    """Return a compacted session object without persisting it."""
+    sess = dict(session)
+    messages = sess.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+    if keep_recent_turns < 0:
+        keep_recent_turns = 0
+    if keep_recent_turns >= len(messages):
+        return sess
+
+    old_count = len(messages) - keep_recent_turns
+    older = messages[:old_count]
+    recent = messages[old_count:]
+    summary_msg: dict[str, Any] = {
+        "role": "model",
+        "text": summary_text,
+        "ts": _now_iso(),
+        "kind": "history_summary",
+        "summary_meta": {
+            "covered_turn_count": len(older),
+            "source_model": source_model,
+            "compacted_at": _now_iso(),
+        },
+    }
+    sess["messages"] = [summary_msg, *recent]
+    return sess

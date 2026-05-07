@@ -27,6 +27,17 @@ class _Resp:
 
 
 class TestWfbGeminiApi(unittest.TestCase):
+    def test_summarization_policy_for_flash(self):
+        p = api.summarization_policy_for_model("gemini-2.5-flash")
+        self.assertEqual(p["max_turns"], 160)
+        self.assertEqual(p["keep_recent_turns"], 64)
+
+    def test_summarize_messages_empty_raises(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            with self.assertRaises(api.GeminiApiError):
+                api.summarize_messages(wfb_home=home, model="gemini-2.5-flash", messages=[])
+
     def test_list_models_with_valid_token(self):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
@@ -132,6 +143,18 @@ class TestWfbGeminiApi(unittest.TestCase):
         state = api.api_managed_state_supported()
         self.assertFalse(state["supported"])
         self.assertIn("generateContent", state["reason"])
+
+    def test_summarize_messages_strict_empty_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            with mock.patch("wfb_gemini_api.ask_with_messages", return_value="   "):
+                with self.assertRaises(api.GeminiApiError) as ctx:
+                    api.summarize_messages(
+                        wfb_home=home,
+                        model="gemini-2.5-flash",
+                        messages=[{"role": "user", "text": "x"}],
+                    )
+            self.assertIn("empty", str(ctx.exception))
 
 
 if __name__ == "__main__":
