@@ -3,7 +3,7 @@ requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "wayfarer-bridge"
+name = "wfb"
 version = "0.1.0"
 description = "Stdlib-only local CLI bridge for Gemini chat memory and world-state context"
 readme = "README.md"
