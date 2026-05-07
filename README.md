@@ -14,12 +14,15 @@ This document freezes **v1** so implementation can proceed without reinterpretat
 - The default relational store is **`~/.wfb/wayfarer.db`**.
 - **`--db PATH`** overrides only the SQLite file path (for projects, backups, tests, etc.). The asset-directory convention still applies when you omit `--db`.
 
-### `wfb init [--db PATH]`
+### `wfb init [--db PATH] [--no-browser] [--force-login]`
 
 - Requires a local OAuth desktop client secret at **`~/.wfb/client_secret.json`** for the OSS/PyPI build.
 - If missing, `init` always prints setup instructions and the official OAuth guide URL, then attempts to open the guide in your browser.
 - Ensures **`~/.wfb/` exists** (`mkdir -p`), then applies the v1 schema to the target database (default `~/.wfb/wayfarer.db`).
 - Creates the DB file at `PATH` when missing.
+- Runs OAuth login and stores credentials at **`~/.wfb/token.json`**.
+- `--no-browser` prints the auth URL instead of attempting browser-open.
+- `--force-login` ignores any cached token and reruns login.
 - **Idempotent:** safe to run multiple times (`CREATE TABLE IF NOT EXISTS`, etc.).
 - Ensures `schema_version` reflects v1 after successful init.
 
@@ -37,7 +40,19 @@ This document freezes **v1** so implementation can proceed without reinterpretat
 - **`--format json`:** deterministic machine-readable snapshot (shape below).
 - **`--limit N`:** caps list previews in text mode (default **5**); applies to highlighted rows where lists are truncated.
 
-Optional future commands (`export`, `validate`) are **out of scope** for v1; v1 ships only **`init`**, **`seed`**, **`status`**.
+### `wfb gemini ping [--limit N]`
+
+- Uses cached OAuth credentials from `~/.wfb/token.json`.
+- Calls Gemini REST models endpoint and prints model count + names.
+- Useful as an authenticated connectivity smoke test.
+
+### `wfb gemini ask --prompt STRING [--model ID]`
+
+- Sends one text prompt to Gemini via REST (`generateContent`).
+- Prints plain text output only (no streaming in this phase).
+- Default model: `gemini-2.5-flash`.
+
+Optional future commands (`export`, `validate`) remain out of scope for this stage.
 
 ---
 
@@ -57,6 +72,17 @@ Minimum steps:
 2. Configure OAuth consent screen and add yourself as a test user while developing.
 3. Create an OAuth **Desktop app** client, download the JSON, and place it at `~/.wfb/client_secret.json`.
 4. Run `wfb init` again.
+
+After successful login, `wfb` stores OAuth tokens locally at:
+
+- **`~/.wfb/token.json`**
+
+Troubleshooting:
+
+- If browser-open fails, copy/paste the printed auth URL manually.
+- For headless/manual environments, run `wfb init --no-browser`.
+- If API calls fail after some time due to token refresh issues, rerun `wfb init --force-login` to refresh local credentials.
+- In testing-mode OAuth projects, `refresh_token_expires_in` may be short (e.g. about 7 days), which requires periodic re-login.
 
 ---
 

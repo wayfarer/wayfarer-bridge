@@ -7,8 +7,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import wfb
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +55,18 @@ class TestWfb(unittest.TestCase):
                         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                         "token_uri": "https://oauth2.googleapis.com/token",
                     }
+                }
+            ),
+            encoding="utf-8",
+        )
+        token = wfb_dir / "token.json"
+        token.write_text(
+            json.dumps(
+                {
+                    "access_token": "cached-token",
+                    "refresh_token": "cached-refresh",
+                    "token_type": "Bearer",
+                    "expires_at": int(time.time()) + 3600,
                 }
             ),
             encoding="utf-8",
@@ -219,6 +235,86 @@ class TestWfb(unittest.TestCase):
             self.assertEqual(r.returncode, 5)
             self.assertIn("~/.wfb/client_secret.json", r.stderr)
             self.assertIn("https://ai.google.dev/gemini-api/docs/oauth", r.stderr)
+
+    def test_init_passes_no_browser_and_force_login_to_oauth(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            fake_home = d / "home"
+            fake_home.mkdir()
+            db = d / "t.db"
+
+            with (
+                mock.patch("wfb.wfb_home", return_value=fake_home),
+                mock.patch("wfb.ensure_client_secret_present", return_value=True),
+                mock.patch("wfb.connect_db") as mock_connect,
+                mock.patch("wfb.init_db"),
+                mock.patch("wfb.ensure_logged_in") as mock_login,
+            ):
+                mock_conn = mock.Mock()
+                mock_connect.return_value = mock_conn
+                rc = wfb.main(
+                    [
+                        "--db",
+                        str(db),
+                        "init",
+                        "--no-browser",
+                        "--force-login",
+                    ]
+                )
+                self.assertEqual(rc, 0)
+                mock_login.assert_called_once_with(
+                    wfb_home=fake_home,
+                    no_browser=True,
+                    force_login=True,
+                )
+                mock_conn.close.assert_called()
+
+    def test_init_oauth_timeout_returns_exit_io(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            fake_home = d / "home"
+            fake_home.mkdir()
+            db = d / "t.db"
+
+            with (
+                mock.patch("wfb.wfb_home", return_value=fake_home),
+                mock.patch("wfb.ensure_client_secret_present", return_value=True),
+                mock.patch("wfb.connect_db") as mock_connect,
+                mock.patch("wfb.init_db"),
+                mock.patch(
+                    "wfb.ensure_logged_in",
+                    side_effect=wfb.OAuthFlowError("OAuth callback timed out or returned no code"),
+                ),
+            ):
+                mock_conn = mock.Mock()
+                mock_connect.return_value = mock_conn
+                rc = wfb.main(["--db", str(db), "init", "--no-browser"])
+                self.assertEqual(rc, 5)
+                mock_conn.close.assert_called()
+
+    def test_gemini_ping_prints_models(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.list_models", return_value=["models/a", "models/b", "models/c"]),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["gemini", "ping", "--limit", "2"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            self.assertIn("Models: 3", written)
+            self.assertIn("- models/a", written)
+            self.assertIn("- models/b", written)
+
+    def test_gemini_ask_prints_response(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.ask_text", return_value="hello from gemini"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["gemini", "ask", "--prompt", "hello"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            self.assertIn("hello from gemini", written)
 
 
 if __name__ == "__main__":

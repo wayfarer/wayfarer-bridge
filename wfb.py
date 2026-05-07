@@ -14,10 +14,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from wfb_db import UPDATED_AT_SQL, connect_db, init_db, require_v1_schema
+from wfb_gemini_api import DEFAULT_MODEL, GeminiApiError, ask_text, list_models
 from wfb_oauth import (
     ensure_client_secret_present,
+    ensure_logged_in,
     maybe_open_oauth_guide,
     print_oauth_setup_instructions,
+    OAuthFlowError,
 )
 from wfb_paths import default_db_path, wfb_home
 
@@ -617,6 +620,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not attempt to open Gemini OAuth guide automatically",
     )
+    initp.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="print OAuth URL instead of attempting to open a browser",
+    )
+    initp.add_argument(
+        "--force-login",
+        action="store_true",
+        help="ignore cached token and run OAuth login again",
+    )
 
     sp = sub.add_parser("seed", help="ingest seed JSON envelope")
     g = sp.add_mutually_exclusive_group(required=True)
@@ -643,7 +656,37 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help=f"preview row cap for text output (default: {DEFAULT_STATUS_LIMIT})",
     )
-    p.set_defaults(file=None, json_data=None, no_open_oauth_guide=False)
+
+    gem = sub.add_parser("gemini", help="call Gemini APIs using local OAuth token")
+    gem_sub = gem.add_subparsers(dest="gemini_command", required=True)
+
+    ping = gem_sub.add_parser("ping", help="list available Gemini models")
+    ping.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        metavar="N",
+        help="max model names to print (default: 10)",
+    )
+
+    ask = gem_sub.add_parser("ask", help="run a single text prompt")
+    ask.add_argument(
+        "--prompt",
+        required=True,
+        help="prompt text to send to Gemini",
+    )
+    ask.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"model id (default: {DEFAULT_MODEL})",
+    )
+    p.set_defaults(
+        file=None,
+        json_data=None,
+        no_open_oauth_guide=False,
+        no_browser=False,
+        force_login=False,
+    )
     return p
 
 
@@ -666,10 +709,43 @@ def main(argv: list[str] | None = None) -> int:
                 init_db(conn)
             finally:
                 conn.close()
+            try:
+                ensure_logged_in(
+                    wfb_home=wfb_home(),
+                    no_browser=args.no_browser,
+                    force_login=args.force_login,
+                )
+            except OAuthFlowError as e:
+                _err(str(e))
+                return EXIT_IO
         except sqlite3.Error as e:
             _err(str(e))
             return EXIT_DB
         return EXIT_OK
+
+    if args.command == "gemini":
+        try:
+            if args.gemini_command == "ping":
+                if args.limit < 0:
+                    _err("--limit must be non-negative")
+                    return EXIT_USAGE
+                names = list_models(wfb_home=wfb_home())
+                print(f"Models: {len(names)}")
+                for name in names[: args.limit]:
+                    print(f"- {name}")
+                return EXIT_OK
+
+            if args.gemini_command == "ask":
+                answer = ask_text(
+                    wfb_home=wfb_home(),
+                    prompt=args.prompt,
+                    model=args.model,
+                )
+                print(answer)
+                return EXIT_OK
+        except (GeminiApiError, OAuthFlowError) as e:
+            _err(str(e))
+            return EXIT_IO
 
     try:
         conn = connect_db(db_path)
