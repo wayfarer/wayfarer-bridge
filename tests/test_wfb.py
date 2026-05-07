@@ -689,6 +689,7 @@ class TestWfb(unittest.TestCase):
         with (
             mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
             mock.patch("wfb.parse_target_types", return_value=("page",)),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
             mock.patch(
                 "wfb.load_chrome_attachment",
                 return_value={
@@ -703,9 +704,13 @@ class TestWfb(unittest.TestCase):
                 return_value={"title": "One", "url": "https://example.test/1", "text_snapshot": "abc"},
             ) as inspect_target,
         ):
-            rc = wfb.main(["chrome", "inspect", "--format", "json"])
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["chrome", "inspect", "--format", "json"])
             self.assertEqual(rc, 0)
             inspect_target.assert_called_once()
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertFalse(payload["debug"]["fallback_used"])
 
     def test_chrome_inspect_saved_webview_expands_default_include_types(self):
         targets = [
@@ -720,6 +725,7 @@ class TestWfb(unittest.TestCase):
         with (
             mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
             mock.patch("wfb.parse_target_types", return_value=("page",)),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
             mock.patch(
                 "wfb.load_chrome_attachment",
                 return_value={
@@ -743,6 +749,7 @@ class TestWfb(unittest.TestCase):
         with (
             mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
             mock.patch("wfb.parse_target_types", return_value=("page",)),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
             mock.patch(
                 "wfb.load_chrome_attachment",
                 return_value={
@@ -757,6 +764,143 @@ class TestWfb(unittest.TestCase):
             rc = wfb.main(["chrome", "inspect", "--format", "json", "--include-types", "page"])
             self.assertEqual(rc, 5)
             self.assertEqual(list_targets.call_args.kwargs["include_types"], ("page",))
+
+    def test_chrome_inspect_port_fallback_follows_detected_debug_ports(self):
+        tgt = {
+            "id": "t1",
+            "title": "Gemini Panel",
+            "url": "https://gemini.google.com/glic",
+            "type": "webview",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9333/devtools/page/t1",
+        }
+
+        def _lt(**kwargs: object) -> list[dict[str, object]]:
+            port = kwargs["port"]
+            if port == 9222:
+                raise wfb.ChromeBridgeError("refused")
+            return [tgt]
+
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb.detect_debug_ports", return_value=[{"port": 9333, "version": {}}]),
+            mock.patch("wfb.list_targets", side_effect=_lt),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "type": "webview",
+                    "webSocketDebuggerUrl": "ws://127.0.0.1:9333/devtools/page/t1",
+                    "debug_port": 9222,
+                },
+            ),
+            mock.patch(
+                "wfb.inspect_target",
+                return_value={"title": "Gemini Panel", "url": "https://gemini.google.com/glic", "text_snapshot": "z"},
+            ),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["chrome", "inspect", "--format", "json"])
+            self.assertEqual(rc, 0)
+            payload = json.loads(
+                "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            )
+            self.assertTrue(payload["debug"]["fallback_used"])
+            self.assertEqual(payload["debug"]["resolved_port"], 9333)
+
+    def test_chrome_inspect_attachment_uses_resolved_target_websocket(self):
+        resolved_target = {
+            "id": "t1",
+            "title": "Gemini Panel",
+            "url": "https://gemini.google.com/glic",
+            "type": "webview",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9333/devtools/page/t1",
+        }
+
+        def _lt(**kwargs: object) -> list[dict[str, object]]:
+            port = int(kwargs["port"])
+            if port == 9222:
+                raise wfb.ChromeBridgeError("refused")
+            return [resolved_target]
+
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb.detect_debug_ports", return_value=[{"port": 9333, "version": {}}]),
+            mock.patch("wfb.list_targets", side_effect=_lt),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "type": "webview",
+                    # Intentionally stale; fallback should replace this with resolved target websocket.
+                    "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+                    "debug_port": 9222,
+                },
+            ),
+            mock.patch("wfb.inspect_target", return_value={"title": "Gemini Panel", "url": "https://gemini.google.com/glic", "text_snapshot": "z"}) as inspect_target,
+        ):
+            rc = wfb.main(["chrome", "inspect", "--format", "json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            inspect_target.call_args.kwargs["ws_url"],
+            "ws://127.0.0.1:9333/devtools/page/t1",
+        )
+
+    def test_list_targets_with_port_fallback_retries_detected_ports(self):
+        calls: list[int] = []
+
+        def _lt(**kwargs: object) -> list[dict[str, str]]:
+            calls.append(int(kwargs["port"]))
+            port = int(kwargs["port"])
+            if port == 9222:
+                raise wfb.ChromeBridgeError("bad")
+            return [{"id": "ok"}]
+
+        with (
+            mock.patch("wfb.detect_debug_ports", return_value=[{"port": 9223, "version": {}}]),
+            mock.patch("wfb.list_targets", side_effect=_lt),
+        ):
+            rows, p = wfb._list_targets_with_port_fallback(port=9222, include_types=("page",))
+        self.assertEqual(p, 9223)
+        self.assertEqual(rows[0]["id"], "ok")
+
+    def test_bridge_doctor_defaults_to_json(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
+            mock.patch("wfb.fetch_version", return_value={"Browser": "Chrome/Test"}),
+            mock.patch("wfb.list_targets", return_value=[]),
+            mock.patch("wfb.load_chrome_attachment", return_value=None),
+            mock.patch("wfb.get_active_session_id", return_value=None),
+            mock.patch("sys.stdout") as out,
+        ):
+            rc = wfb.main(["bridge", "doctor"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertTrue(payload["endpoint"]["reachable"])
+            self.assertGreaterEqual(len(payload["recommendations"]), 1)
+
+    def test_bridge_doctor_invalid_port(self):
+        rc = wfb.main(["bridge", "doctor", "--port", "0"])
+        self.assertEqual(rc, 2)
+
+    def test_bridge_doctor_text_format_has_recommendation_lines(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
+            mock.patch("wfb.fetch_version", return_value={"Browser": "Chrome/Test"}),
+            mock.patch("wfb.list_targets", return_value=[]),
+            mock.patch("wfb.load_chrome_attachment", return_value=None),
+            mock.patch("wfb.get_active_session_id", return_value=None),
+            mock.patch("sys.stdout") as out,
+        ):
+            rc = wfb.main(["bridge", "doctor", "--format", "text"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            self.assertIn("endpoint_reachable=", written)
+            self.assertIn("- ", written)
 
     def test_chrome_targets_gemini_only_passed(self):
         with (

@@ -195,6 +195,13 @@ explicit `--include-types` is provided, `wfb` auto-includes the attachment
 target type (for example `webview`) so inspect can resolve saved side-panel
 targets without extra flags.
 
+**Debug-port probing**: `inspect` tries your `--port` (default `9222`) first,
+then other locally detected debugging ports in stable order until
+`/json/list` succeeds — same ordering as `chrome capture`/`bridge`. When JSON
+output is enabled, a top-level `debug` object documents
+`requested_port`, `resolved_port`, and whether a fallback port was used
+(`fallback_used`).
+
 ### `wfb chrome detach`
 
 Clears the persisted attachment file.
@@ -211,11 +218,25 @@ Runs discover -> attach -> inspect in one deterministic command.
 - Selection priority: explicit `--target-id`, then focused/active target, then heuristic ranking, then first-candidate fallback.
 - JSON output includes `selection`, `target`, `attachment`, `inspect`, and debug ports (`requested_port`, `resolved_port`).
 
+### `wfb bridge doctor [--port N] [--include-types page,webview] [--gemini-only] [--format json|text]`
+
+Read-only diagnostics for agents: endpoint reachability (`/json/version`), target
+summaries (`/json/list`), persisted attachment state, Gemini session id, and
+ordered **recommendations** (recover / happy-path next commands). Default format
+is JSON; `--format text` prints a compact checklist.
+
+Example:
+
+```sh
+wfb bridge doctor
+wfb bridge doctor --include-types page,webview --gemini-only --format text
+```
+
 ### `wfb bridge ask --prompt "..." [--session ID] [--model MODEL] [--system TEXT] [--port N] [--target-id ID] [--include-types page,webview] [--gemini-only] [--max-chars N] [--format json|text]`
 
 Runs the full browser-to-Gemini pipeline in one command: capture -> prompt envelope -> Gemini ask.
 
-- Captures browser context via the same logic as `chrome capture`.
+- Captures browser context via the same logic as `chrome capture` (including unified debug-port probing: `requested_port` vs `resolved_port` in the `capture` section when fallback occurs).
 - Builds a versioned prompt envelope embedding the page snapshot and user prompt.
 - Sends the composed prompt to Gemini within the target session (creates one if none active).
 - Appends both the composed prompt and model response to session history.
@@ -235,6 +256,8 @@ wfb bridge ask --prompt "extract the test failures" --gemini-only --format text
 ### `wfb bridge loop --prompt "..." [--max-iterations N] [--stability-check on|off] [--session ID] [--model MODEL] [--system TEXT] [--port N] [--target-id ID] [--include-types page,webview] [--gemini-only] [--max-chars N] [--format json|text]`
 
 Runs a bounded iterative automation loop: each iteration captures browser context and asks Gemini about it.
+
+- Uses the same capture path as `wfb bridge ask` / `chrome capture` for port probing and provenance (`requested_port`/`resolved_port` per iteration).
 
 - `--max-iterations N` (default 3): hard upper bound on iterations.
 - `--stability-check on`: stops early if the page snapshot is unchanged between iterations.

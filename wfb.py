@@ -72,22 +72,24 @@ DEFAULT_STATUS_LIMIT = 5
 BRIDGE_PROMPT_TEMPLATE_VERSION = "1"
 AGENT_WORKFLOW_GUIDANCE = """Agent workflow guidance:
   1) Initialize once: `wfb init`
-  2) One-shot browser-to-Gemini bridge:
+  2) Diagnostics (blind start):
+       - `wfb bridge doctor --format json`
+  3) One-shot browser-to-Gemini bridge:
        - `wfb bridge ask --prompt "summarize this page" --format json`
        (runs capture -> prompt envelope -> gemini ask in a single call)
-  3) Iterative automation:
+  4) Iterative automation:
        - `wfb bridge loop --prompt "check for updates" --max-iterations 5`
        (bounded loop: capture -> ask each iteration, stops on budget/stability/error)
-  4) For manual browser-context capture:
+  5) For manual browser-context capture:
        - `wfb chrome capture --format json`
        - `wfb chrome targets --include-types page,webview --gemini-only`
-  5) For durable local memory and model control:
+  6) For durable local memory and model control:
        - create/select session with `wfb gemini session new|use`
        - run asks with `wfb gemini ask --session <id> ...`
-  6) State ownership:
+  7) State ownership:
        - browser panel text = live context source
        - local gemini session = durable agent execution history
-  7) Optional persistence:
+  8) Optional persistence:
        - enable `--sync-world-state on` when chat context should update SQLite world state.
 """
 
@@ -531,31 +533,222 @@ def _chrome_current_payload(home: Path, fallback_port: int = DEFAULT_DEBUG_PORT)
     return payload
 
 
+def _ordered_debug_port_candidates(requested_port: int) -> list[int]:
+    """Prefer requested_port first; append other healthy ports deterministically."""
+    out: list[int] = []
+    if requested_port not in out:
+        out.append(requested_port)
+    for entry in detect_debug_ports():
+        p = int(entry["port"])
+        if p not in out:
+            out.append(p)
+    return out
+
+
 def _list_targets_with_port_fallback(
     *,
     port: int,
     include_types: tuple[str, ...],
     gemini_only: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
-    try:
-        targets = list_targets(port=port, include_types=include_types, gemini_only=gemini_only)
-        return targets, port
-    except ChromeBridgeError:
-        detected = detect_debug_ports()
-        for entry in detected:
-            resolved = int(entry["port"])
-            if resolved == port:
-                continue
-            try:
-                targets = list_targets(
-                    port=resolved,
-                    include_types=include_types,
-                    gemini_only=gemini_only,
-                )
-                return targets, resolved
-            except ChromeBridgeError:
-                continue
-        raise
+    """Try list_targets across requested port then other detected endpoints."""
+    last_error: ChromeBridgeError | None = None
+    for candidate in _ordered_debug_port_candidates(port):
+        try:
+            targets = list_targets(
+                port=candidate,
+                include_types=include_types,
+                gemini_only=gemini_only,
+            )
+            return targets, candidate
+        except ChromeBridgeError as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    raise ChromeBridgeError(f"no Chrome debug endpoints reachable near port {port}")
+
+
+def _resolve_inspect_target_on_ports(
+    *,
+    requested_port: int,
+    include_types: tuple[str, ...],
+    target_id: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+    """Locate target_id across requested port then other detected endpoints."""
+    last_error: ChromeBridgeError | None = None
+    for candidate in _ordered_debug_port_candidates(requested_port):
+        try:
+            targets = list_targets(port=candidate, include_types=include_types)
+        except ChromeBridgeError as exc:
+            last_error = exc
+            continue
+        try:
+            chosen = choose_target(targets, target_id)
+            return chosen, targets, candidate
+        except ChromeBridgeError as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    raise ChromeBridgeError(f"target not found: {target_id}")
+
+
+def _inspect_debug_meta(*, requested_port: int | None, resolved_port: int | None) -> dict[str, Any]:
+    if resolved_port is None:
+        return {"requested_port": requested_port, "resolved_port": None, "fallback_used": False}
+    req = int(requested_port) if requested_port is not None else int(resolved_port)
+    resolved = int(resolved_port)
+    return {
+        "requested_port": req,
+        "resolved_port": resolved,
+        "fallback_used": resolved != req,
+    }
+
+
+def _target_is_gemini_like(t: dict[str, Any]) -> bool:
+    url = str(t.get("url", "")).lower()
+    title = str(t.get("title", "")).lower()
+    return "gemini.google.com/glic" in url or "gemini" in title
+
+
+def _bridge_doctor_payload(
+    *,
+    home: Path,
+    requested_port: int,
+    include_types: tuple[str, ...],
+    gemini_only: bool,
+    sample_limit: int = 5,
+) -> dict[str, Any]:
+    warnings: list[str] = []
+
+    resolved_port: int | None = None
+    browser_line = ""
+    for candidate in _ordered_debug_port_candidates(requested_port):
+        try:
+            ver = fetch_version(port=candidate)
+            resolved_port = int(candidate)
+            browser_line = str(ver.get("Browser", ""))
+            break
+        except ChromeBridgeError:
+            continue
+
+    endpoint_payload: dict[str, Any] = {
+        "reachable": resolved_port is not None,
+        "browser": browser_line or None,
+        "requested_port": int(requested_port),
+        "resolved_port": resolved_port,
+        "fallback_used": resolved_port is not None and resolved_port != int(requested_port),
+    }
+
+    targets: list[dict[str, Any]] = []
+    counts: dict[str, int] = {"page": 0, "webview": 0}
+    gemini_like = 0
+    if resolved_port is not None:
+        try:
+            targets = list_targets(
+                port=resolved_port,
+                include_types=include_types,
+                gemini_only=gemini_only,
+            )
+        except ChromeBridgeError as e:
+            warnings.append(f"targets list failed: {e}")
+            targets = []
+        for t in targets:
+            ttype = str(t.get("type", "")).lower()
+            if ttype in counts:
+                counts[ttype] += 1
+            if _target_is_gemini_like(t):
+                gemini_like += 1
+
+    sample: list[dict[str, Any]] = []
+    for t in targets[: max(0, sample_limit)]:
+        sample.append(
+            {
+                "id": t.get("id"),
+                "title": t.get("title"),
+                "url": t.get("url"),
+                "type": t.get("type"),
+            }
+        )
+
+    attachment = load_chrome_attachment(home)
+    target_present: bool | None = None
+    attachment_payload = attachment
+    if attachment is None:
+        attachment_payload = None
+        target_present = None
+    elif resolved_port is not None:
+        tid = str(attachment.get("target_id", ""))
+        target_present = any(str(t.get("id", "")) == tid for t in targets)
+    else:
+        target_present = None
+
+    session_id = get_active_session_id(home)
+    session_loaded = False
+    if isinstance(session_id, str) and session_id:
+        session_loaded = load_session(home, session_id) is not None
+
+    recommendations: list[str] = []
+    if not endpoint_payload["reachable"]:
+        recommendations.append(
+            "Endpoint down: try `wfb chrome launch --port {0}` "
+            "(or `--profile-mode user`) then rerun doctor.".format(requested_port)
+        )
+        recommendations.append(
+            "If Chrome is already listening with remote debugging, pass `--port <n>` matching that instance."
+        )
+        att_unreachable = attachment if isinstance(attachment, dict) else None
+        return {
+            "endpoint": endpoint_payload,
+            "targets": {"total": len(targets), "counts_by_type": counts, "gemini_like": gemini_like, "sample": sample},
+            "attachment": {
+                "present": att_unreachable is not None,
+                "target_present": None,
+                "payload": att_unreachable,
+            },
+            "gemini_session": {"active_session_id": session_id, "session_known": session_loaded},
+            "recommendations": recommendations,
+            "warnings": warnings,
+        }
+
+    if not targets:
+        recommendations.append(
+            "No attachable targets for current filters — try "
+            "`wfb chrome targets --include-types page,webview --gemini-only`."
+        )
+
+    att = attachment_payload if isinstance(attachment_payload, dict) else None
+    if att:
+        recommendations.append(f"Persisted attachment: target_id `{att.get('target_id','')}`.")
+        if target_present is False:
+            recommendations.append(
+                "Attachment target not listed on endpoint — run `wfb chrome attach --target-id <id>` "
+                "after `chrome targets`, or use `chrome capture --include-types page,webview`."
+            )
+    else:
+        recommendations.append(
+            "No attachment yet — prefer `wfb chrome capture` or attach with "
+            "`wfb chrome attach --target-id ... --include-types page,webview`."
+        )
+
+    if session_loaded:
+        recommendations.append(f"Gemini active session `{session_id}` — use `wfb bridge ask --prompt \"...\" --session {session_id}` if needed.")
+    else:
+        recommendations.append("No active Gemini session — `bridge ask`/`bridge loop` creates one implicitly, or run `gemini session new`.")
+    recommendations.append(
+        "Fast path: `wfb bridge doctor` then "
+        "`wfb bridge ask --prompt \"summarize visible context\" --port {0}` (port auto-fallbacks)".format(requested_port)
+    )
+
+    return {
+        "endpoint": endpoint_payload,
+        "targets": {"total": len(targets), "counts_by_type": counts, "gemini_like": gemini_like, "sample": sample},
+        "attachment": {"present": att is not None, "target_present": target_present, "payload": att},
+        "gemini_session": {"active_session_id": session_id, "session_known": session_loaded},
+        "recommendations": recommendations,
+        "warnings": warnings,
+    }
 
 
 def _has_flag(argv: list[str], flag: str) -> bool:
@@ -1166,6 +1359,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     b_loop.add_argument("--format", choices=("json", "text"), default="json")
 
+    b_doctor = bridge_sub.add_parser("doctor", help="diagnose Chrome debug endpoint and suggest next commands")
+    b_doctor.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_DEBUG_PORT,
+        help=f"Chrome debug port to probe first (default: {DEFAULT_DEBUG_PORT})",
+    )
+    b_doctor.add_argument(
+        "--include-types",
+        default="page,webview",
+        help="comma-separated target types when listing targets (default: page,webview)",
+    )
+    b_doctor.add_argument(
+        "--gemini-only",
+        action="store_true",
+        help="when listing targets, apply same Gemini narrowing as chrome targets --gemini-only",
+    )
+    b_doctor.add_argument("--format", choices=("json", "text"), default="json")
+
     p.set_defaults(
         file=None,
         json_data=None,
@@ -1580,57 +1792,67 @@ def main(argv: list[str] | None = None) -> int:
                     return EXIT_USAGE
                 target: dict[str, Any] | None = None
                 ws_url = ""
-                target_id = args.target_id
+                inspect_requested_port = DEFAULT_DEBUG_PORT
+                inspect_target_key = args.target_id
                 port = args.port
                 targets: list[dict[str, Any]] = []
                 selected_types = parse_target_types(args.include_types)
                 include_types_explicit = _has_flag(argv, "--include-types")
 
-                if target_id:
-                    resolved_port = port if port is not None else DEFAULT_DEBUG_PORT
+                if inspect_target_key:
+                    inspect_requested_port = port if port is not None else DEFAULT_DEBUG_PORT
                     try:
-                        targets = list_targets(port=resolved_port, include_types=selected_types)
-                    except ChromeBridgeError as e:
-                        _err(f"{e}; {_chrome_recovery_hint(resolved_port)}")
-                        return EXIT_IO
-                    try:
-                        target = choose_target(targets, target_id)
+                        target, targets, resolved_port_used = _resolve_inspect_target_on_ports(
+                            requested_port=inspect_requested_port,
+                            include_types=selected_types,
+                            target_id=str(inspect_target_key),
+                        )
                     except ChromeBridgeError as e:
                         _err(
                             f"{e}; try --include-types page,webview; "
-                            f"{_chrome_recovery_hint(resolved_port)}"
+                            f"{_chrome_recovery_hint(inspect_requested_port)}"
                         )
                         return EXIT_IO
                     ws_url = str(target.get("webSocketDebuggerUrl", ""))
-                    port = resolved_port
+                    port = resolved_port_used
                 else:
                     attachment = load_chrome_attachment(wfb_home())
                     if attachment is None:
                         _err("no attached Chrome target; run `wfb chrome attach --target-id ...`")
                         return EXIT_IO
                     ws_url = str(attachment.get("webSocketDebuggerUrl", ""))
-                    target_id = str(attachment.get("target_id", ""))
+                    inspect_target_key = str(attachment.get("target_id", ""))
                     if port is None:
                         saved_port = attachment.get("debug_port")
                         if isinstance(saved_port, int):
                             port = saved_port
                         else:
                             port = DEFAULT_DEBUG_PORT
+                    inspect_requested_port = int(port)
                     selected_types = _inspect_effective_types(
                         selected_types=selected_types,
                         include_types_explicit=include_types_explicit,
                         attachment=attachment,
                     )
                     try:
-                        targets = list_targets(port=port, include_types=selected_types)
+                        targets, resolved_port_used = _list_targets_with_port_fallback(
+                            port=inspect_requested_port,
+                            include_types=selected_types,
+                            gemini_only=False,
+                        )
                     except ChromeBridgeError as e:
-                        _err(f"{e}; {_chrome_recovery_hint(port)}")
+                        _err(f"{e}; {_chrome_recovery_hint(inspect_requested_port)}")
                         return EXIT_IO
                     try:
-                        target = choose_target(targets, target_id)
+                        target = choose_target(targets, inspect_target_key)
                     except ChromeBridgeError as e:
-                        _err(f"{e}; try --include-types page,webview; {_chrome_recovery_hint(port)}")
+                        _err(
+                            f"{e}; try --include-types page,webview; "
+                            f"{_chrome_recovery_hint(resolved_port_used)}"
+                        )
                         return EXIT_IO
+                    ws_url = str(target.get("webSocketDebuggerUrl", ""))
+                    port = resolved_port_used
 
                 if not ws_url:
                     _err("target has no websocket debugger url")
@@ -1651,6 +1873,10 @@ def main(argv: list[str] | None = None) -> int:
                 if port is not None:
                     context["debug_port"] = int(port)
                 if args.format == "json":
+                    context["debug"] = _inspect_debug_meta(
+                        requested_port=inspect_requested_port,
+                        resolved_port=int(port) if port is not None else DEFAULT_DEBUG_PORT,
+                    )
                     print(json.dumps(context, indent=2, sort_keys=True))
                 else:
                     print(f"title: {context.get('title','')}")
@@ -1761,6 +1987,39 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "bridge":
         try:
+            if args.bridge_command == "doctor":
+                if args.port <= 0:
+                    _err("--port must be positive")
+                    return EXIT_USAGE
+                selected_types = parse_target_types(args.include_types)
+                payload = _bridge_doctor_payload(
+                    home=wfb_home(),
+                    requested_port=int(args.port),
+                    include_types=selected_types,
+                    gemini_only=bool(args.gemini_only),
+                )
+                if args.format == "json":
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    ep = payload["endpoint"]
+                    tg = payload["targets"]
+                    att = payload["attachment"]
+                    gsm = payload["gemini_session"]
+                    print(f"endpoint_reachable={ep.get('reachable')}")
+                    print(f"browser={ep.get('browser','')}")
+                    print(f"debug_port_requested={ep.get('requested_port')}")
+                    print(f"debug_port_resolved={ep.get('resolved_port')}")
+                    print(f"targets_total={tg.get('total')}")
+                    print(f"counts_by_type={tg.get('counts_by_type')}")
+                    print(f"gemini_like={tg.get('gemini_like')}")
+                    print(f"attached={bool(att.get('present'))}")
+                    print(f"target_present={att.get('target_present')}")
+                    print(f"active_session={gsm.get('active_session_id')}")
+                    print(f"session_known={gsm.get('session_known')}")
+                    for line in payload.get("recommendations", []):
+                        print(f"- {line}")
+                return EXIT_OK
+
             if args.bridge_command == "ask":
                 if args.max_chars <= 0:
                     _err("--max-chars must be positive")
@@ -1798,6 +2057,7 @@ def main(argv: list[str] | None = None) -> int:
                     url=str(target.get("url", "")),
                     title=str(target.get("title", "")),
                     debug_port=resolved_port,
+                    target_type=str(target.get("type", "")),
                 )
                 inspect_result = inspect_target(
                     ws_url=ws_url,
