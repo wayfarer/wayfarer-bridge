@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wayfarer-bridge"
+version = "0.1.0"
+description = "Stdlib-only local CLI bridge for Gemini chat memory and world-state context"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Wayfarer Bridge Contributors" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: OS Independent",
+  "Environment :: Console",
+  "Topic :: Software Development :: Build Tools",
+]
+
+[project.scripts]
+wfb = "wfb:main"
+
+[project.urls]
+Homepage = "https://github.com/wayfarer/wayfarer-bridge"
+Issues = "https://github.com/wayfarer/wayfarer-bridge/issues"
+
+[tool.setuptools]
+py-modules = [
+  "wfb",
+  "wfb_db",
+  "wfb_paths",
+  "wfb_oauth",
+  "wfb_gemini_api",
+  "wfb_gemini_sessions",
+]

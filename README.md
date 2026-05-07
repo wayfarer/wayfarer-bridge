@@ -21,23 +21,30 @@ Direct attachment to active browser Gemini side-panel sessions is not available 
 
 Not yet supported:
 
-- Packaged install / console entry point. For now, use an alias or run `python3 wfb.py`.
 - Direct connection to active Gemini browser tabs or side-panel sessions.
 - A centralized OAuth client secret for the open-source/PyPI path.
 
 ## Quick Start
 
-From the repository root, either run the script directly:
+Install locally (editable) from the repository root:
+
+```sh
+python3 -m pip install -e .
+```
+
+Then use:
+
+```sh
+wfb --help
+```
+
+You can also run the script directly:
 
 ```sh
 python3 wfb.py --help
 ```
 
-Or create a local alias:
-
-```sh
-alias wfb='python3 /path/to/wayfarer-bridge/wfb.py'
-```
+For isolated testing, install in a virtual environment first.
 
 Set up OAuth:
 
@@ -409,8 +416,40 @@ The security posture is intentionally conservative: local-first, stdlib-only, no
 
 ## Known Limits / Next Work
 
-- No packaged install flow yet.
 - No direct browser Gemini session attach through official API endpoints validated so far.
 - No retry/backoff policy for transient Gemini `429` / `503` errors yet.
 - No tool/function-calling support yet.
 - Summarization thresholds are heuristic and should be adjusted with real usage.
+
+## Packaging and Release (PyPI-style)
+
+Build distribution artifacts:
+
+```sh
+python3 -m pip install --upgrade build
+python3 -m build
+```
+
+This generates:
+
+- `dist/wayfarer_bridge-0.1.0.tar.gz` (sdist)
+- `dist/wayfarer_bridge-0.1.0-py3-none-any.whl` (wheel)
+
+Check artifacts before upload:
+
+```sh
+python3 -m pip install --upgrade twine
+python3 -m twine check dist/*
+```
+
+Upload to TestPyPI:
+
+```sh
+python3 -m twine upload --repository testpypi dist/*
+```
+
+Upload to PyPI:
+
+```sh
+python3 -m twine upload dist/*
+```
