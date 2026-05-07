@@ -20,6 +20,7 @@ wfb chrome launch --profile-mode isolated
 wfb chrome targets --include-types page,webview --format text
 wfb chrome attach --target-id <id> --include-types page,webview
 wfb chrome inspect --include-types page,webview --format json
+wfb chrome capture --include-types page,webview --format json
 wfb chrome current
 wfb chrome detach
 ```
@@ -30,10 +31,20 @@ Defaults remain backward-compatible: without `--include-types`, `targets`/`attac
 
 1. `launch` first probes for an existing debug endpoint on the requested port; if missing, it probes common fallback ports, then starts Chrome with `--remote-debugging-port` if needed.
 2. `targets` reads `/json/list`.
-3. `attach` stores selected target metadata at `~/.wfb/chrome_attachment.json`.
-4. `inspect` opens the target websocket and calls CDP `Runtime.evaluate`.
-5. `inspect` returns bounded JSON context (`url`, `title`, `selected_text`, `text_snapshot`) where `text_snapshot` is truncated strictly by `--max-chars`.
-6. `current` reports persisted attachment state and endpoint health for recovery/debugging.
+3. `capture` can run full discover -> attach -> inspect with deterministic selection provenance.
+4. `attach` stores selected target metadata at `~/.wfb/chrome_attachment.json`.
+5. `inspect` opens the target websocket and calls CDP `Runtime.evaluate`.
+6. `inspect` returns bounded JSON context (`url`, `title`, `selected_text`, `text_snapshot`) where `text_snapshot` is truncated strictly by `--max-chars`.
+7. `current` reports persisted attachment state and endpoint health for recovery/debugging.
+
+## Capture selection policy
+
+`wfb chrome capture` resolves a target in this order:
+
+1. Explicit `--target-id` when provided.
+2. Focused/active target when present in discovered metadata.
+3. Heuristic ranking (prefer non-omnibox targets, then Gemini-signaled targets).
+4. First candidate fallback.
 
 ## Troubleshooting
 

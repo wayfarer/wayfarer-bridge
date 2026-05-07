@@ -198,6 +198,14 @@ Clears the persisted attachment file.
 
 Shows the current persisted attachment and endpoint health. Default output is JSON.
 
+### `wfb chrome capture [--target-id ID] [--port N] [--include-types page,webview] [--gemini-only] [--max-chars N] [--format json|text]`
+
+Runs discover -> attach -> inspect in one deterministic command.
+
+- Defaults to `--include-types page,webview` for side-panel compatibility.
+- Selection priority: explicit `--target-id`, then focused/active target, then heuristic ranking, then first-candidate fallback.
+- JSON output includes `selection`, `target`, `attachment`, `inspect`, and debug ports (`requested_port`, `resolved_port`).
+
 ## Gemini Sessions For Agents
 
 The Gemini REST calls used by `wfb` do not return a reusable API-managed conversation handle. See `docs/gemini_session_discovery.md` for the discovery notes.

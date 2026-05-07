@@ -17,11 +17,13 @@ from wfb_chrome_bridge import (
     DEFAULT_DEBUG_PORT,
     ChromeBridgeError,
     choose_target,
+    detect_debug_ports,
     fetch_version,
     inspect_target,
     launch_chrome_debug,
     list_targets,
     parse_target_types,
+    select_capture_target,
 )
 from wfb_chrome_session import clear_attachment, load_attachment as load_chrome_attachment, save_attachment
 from wfb_db import UPDATED_AT_SQL, connect_db, init_db, require_v1_schema
@@ -522,6 +524,33 @@ def _chrome_current_payload(home: Path, fallback_port: int = DEFAULT_DEBUG_PORT)
     return payload
 
 
+def _list_targets_with_port_fallback(
+    *,
+    port: int,
+    include_types: tuple[str, ...],
+    gemini_only: bool = False,
+) -> tuple[list[dict[str, Any]], int]:
+    try:
+        targets = list_targets(port=port, include_types=include_types, gemini_only=gemini_only)
+        return targets, port
+    except ChromeBridgeError:
+        detected = detect_debug_ports()
+        for entry in detected:
+            resolved = int(entry["port"])
+            if resolved == port:
+                continue
+            try:
+                targets = list_targets(
+                    port=resolved,
+                    include_types=include_types,
+                    gemini_only=gemini_only,
+                )
+                return targets, resolved
+            except ChromeBridgeError:
+                continue
+        raise
+
+
 def _annotate_sync_envelope(
     envelope: dict[str, Any], *, session_id: str, scope: str | None
 ) -> dict[str, Any]:
@@ -982,6 +1011,27 @@ def build_parser() -> argparse.ArgumentParser:
     c_detach.add_argument("--format", choices=("text", "json"), default="text")
     c_current = chrome_sub.add_parser("current", help="show current attached target and endpoint health")
     c_current.add_argument("--format", choices=("json", "text"), default="json")
+    c_capture = chrome_sub.add_parser("capture", help="discover, attach, and inspect in one command")
+    c_capture.add_argument("--target-id", help="explicit target id override")
+    c_capture.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_DEBUG_PORT,
+        help=f"remote debugging port (default: {DEFAULT_DEBUG_PORT})",
+    )
+    c_capture.add_argument(
+        "--include-types",
+        default="page,webview",
+        help="comma-separated target types to consider (default: page,webview)",
+    )
+    c_capture.add_argument("--gemini-only", action="store_true", help="restrict capture candidates to Gemini targets")
+    c_capture.add_argument(
+        "--max-chars",
+        type=int,
+        default=4000,
+        help="max snapshot text chars (default: 4000)",
+    )
+    c_capture.add_argument("--format", choices=("json", "text"), default="json")
     p.set_defaults(
         file=None,
         json_data=None,
@@ -1496,6 +1546,72 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"debug_port: {endpoint.get('port')}")
                     print(f"endpoint_reachable: {bool(endpoint.get('reachable', False))}")
                     print(f"target_present: {payload.get('target_present')}")
+                return EXIT_OK
+
+            if args.chrome_command == "capture":
+                if args.port <= 0:
+                    _err("--port must be positive")
+                    return EXIT_USAGE
+                if args.max_chars <= 0:
+                    _err("--max-chars must be positive")
+                    return EXIT_USAGE
+                selected_types = parse_target_types(args.include_types)
+                try:
+                    targets, resolved_port = _list_targets_with_port_fallback(
+                        port=args.port,
+                        include_types=selected_types,
+                        gemini_only=bool(args.gemini_only),
+                    )
+                except ChromeBridgeError as e:
+                    _err(f"{e}; {_chrome_recovery_hint(args.port)}")
+                    return EXIT_IO
+                try:
+                    target, selection_method, selection_reason = select_capture_target(
+                        targets,
+                        target_id=args.target_id,
+                    )
+                except ChromeBridgeError as e:
+                    _err(f"{e}; {_chrome_recovery_hint(resolved_port)}")
+                    return EXIT_IO
+                ws_url = str(target.get("webSocketDebuggerUrl", ""))
+                if not ws_url:
+                    _err("selected target missing websocket debugger url")
+                    return EXIT_IO
+                attachment = save_attachment(
+                    wfb_home(),
+                    target_id=str(target.get("id", "")),
+                    ws_url=ws_url,
+                    url=str(target.get("url", "")),
+                    title=str(target.get("title", "")),
+                    debug_port=resolved_port,
+                )
+                inspect_payload = inspect_target(
+                    ws_url=ws_url,
+                    max_chars=args.max_chars,
+                )
+                inspect_payload["target"] = {
+                    "id": str(target.get("id", "")),
+                    "title": str(target.get("title", "")),
+                    "url": str(target.get("url", "")),
+                    "type": str(target.get("type", "")),
+                }
+                inspect_payload["debug_port"] = int(resolved_port)
+                payload = {
+                    "selection": {"method": selection_method, "reason": selection_reason},
+                    "target": inspect_payload["target"],
+                    "attachment": attachment,
+                    "inspect": inspect_payload,
+                    "debug": {"requested_port": int(args.port), "resolved_port": int(resolved_port)},
+                }
+                if args.format == "json":
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    print(f"selection_method: {selection_method}")
+                    print(f"target_id: {payload['target']['id']}")
+                    print(f"title: {payload['target']['title']}")
+                    print(f"url: {payload['target']['url']}")
+                    print(f"debug_port: {resolved_port}")
+                    print(payload["inspect"].get("text_snapshot", ""))
                 return EXIT_OK
         except ChromeBridgeError as e:
             _err(str(e))

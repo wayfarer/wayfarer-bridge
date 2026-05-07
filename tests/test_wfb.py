@@ -811,6 +811,46 @@ class TestWfb(unittest.TestCase):
             written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
             self.assertIn("no attachment", written)
 
+    def test_chrome_capture_defaults_to_json(self):
+        target = {
+            "id": "t1",
+            "title": "Gemini Chat",
+            "url": "https://gemini.google.com/glic",
+            "type": "webview",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9333/devtools/page/t1",
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9333)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "selected by heuristic ranking")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value={"text_snapshot": "abc", "text_snapshot_chars": 3}),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["chrome", "capture"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["selection"]["method"], "heuristic")
+            self.assertEqual(payload["target"]["id"], "t1")
+            self.assertEqual(payload["debug"]["resolved_port"], 9333)
+
+    def test_chrome_capture_selection_error_includes_recovery_hint(self):
+        with (
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([], 9222)),
+            mock.patch(
+                "wfb.select_capture_target",
+                side_effect=wfb.ChromeBridgeError("no capture candidates found"),
+            ),
+            mock.patch("sys.stderr") as err,
+        ):
+            rc = wfb.main(["chrome", "capture"])
+            self.assertEqual(rc, 5)
+            written = "".join(call.args[0] for call in err.write.call_args_list if call.args)
+            self.assertIn("next steps:", written)
+
 
 if __name__ == "__main__":
     unittest.main()

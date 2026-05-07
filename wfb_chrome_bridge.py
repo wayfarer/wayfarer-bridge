@@ -153,6 +153,44 @@ def choose_target(targets: list[dict[str, Any]], target_id: str) -> dict[str, An
     raise ChromeBridgeError(f"target not found: {target_id}")
 
 
+def select_capture_target(
+    targets: list[dict[str, Any]],
+    *,
+    target_id: str | None = None,
+) -> tuple[dict[str, Any], str, str]:
+    if not targets:
+        raise ChromeBridgeError("no capture candidates found")
+    if target_id:
+        chosen = choose_target(targets, target_id)
+        return chosen, "explicit_id", "selected by --target-id"
+
+    for t in targets:
+        if bool(t.get("active")) or bool(t.get("attached")):
+            return t, "focused", "selected focused/active target"
+
+    def _score(t: dict[str, Any]) -> int:
+        score = 0
+        url = str(t.get("url", "")).lower()
+        title = str(t.get("title", "")).lower()
+        if not url.startswith("chrome://omnibox-popup"):
+            score += 4
+        if "gemini.google.com/glic" in url or "gemini" in title:
+            score += 3
+        if str(t.get("type", "")).lower() == "webview":
+            score += 1
+        return score
+
+    scored = sorted(
+        ((idx, _score(t), t) for idx, t in enumerate(targets)),
+        key=lambda row: (row[1], -row[0]),
+        reverse=True,
+    )
+    _, best_score, chosen = scored[0]
+    if best_score > 0:
+        return chosen, "heuristic", "selected by heuristic ranking"
+    return targets[0], "fallback_first", "selected first candidate fallback"
+
+
 def _chrome_launch_args(
     *,
     chrome_path: str,

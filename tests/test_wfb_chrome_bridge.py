@@ -68,6 +68,24 @@ class TestWfbChromeBridge(unittest.TestCase):
         self.assertEqual(len(pages), 1)
         self.assertEqual(pages[0]["id"], "p1")
 
+    def test_select_capture_target_prefers_active(self):
+        targets = [
+            {"id": "a", "title": "A", "url": "https://example.test/a", "type": "page"},
+            {"id": "b", "title": "B", "url": "https://example.test/b", "type": "page", "active": True},
+        ]
+        chosen, method, _ = bridge.select_capture_target(targets)
+        self.assertEqual(chosen["id"], "b")
+        self.assertEqual(method, "focused")
+
+    def test_select_capture_target_explicit_id(self):
+        targets = [
+            {"id": "a", "title": "A", "url": "https://example.test/a", "type": "page"},
+            {"id": "b", "title": "Gemini", "url": "https://gemini.google.com/glic", "type": "webview"},
+        ]
+        chosen, method, _ = bridge.select_capture_target(targets, target_id="a")
+        self.assertEqual(chosen["id"], "a")
+        self.assertEqual(method, "explicit_id")
+
     def test_launch_short_circuits_when_endpoint_exists(self):
         with (
             mock.patch.object(bridge, "fetch_version", return_value={"Browser": "Chrome/1"}) as fetch_version,
