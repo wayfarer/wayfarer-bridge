@@ -467,8 +467,8 @@ python3 -m build
 
 This generates:
 
-- `dist/wayfarer_bridge-0.1.0.tar.gz` (sdist)
-- `dist/wayfarer_bridge-0.1.0-py3-none-any.whl` (wheel)
+- `dist/wfb-0.1.0.tar.gz` (sdist)
+- `dist/wfb-0.1.0-py3-none-any.whl` (wheel)
 
 Check artifacts before upload:
 
