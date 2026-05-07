@@ -830,7 +830,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout-seconds",
         type=float,
         default=12.0,
-        help="launch/verify timeout seconds (default: 12.0)",
+        help="launch/verify timeout seconds; launch is skipped if endpoint already exists (default: 12.0)",
     )
     c_launch.add_argument("--format", choices=("text", "json"), default="text")
 
@@ -1200,6 +1200,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"Chrome debug ready on port {args.port}")
                     print(f"Browser: {browser}")
                     print(f"profile_mode: {args.profile_mode}")
+                    print(f"already_running: {bool(payload.get('already_running', False))}")
                 return EXIT_OK
 
             if args.chrome_command == "targets":

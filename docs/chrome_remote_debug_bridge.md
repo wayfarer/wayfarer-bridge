@@ -25,11 +25,11 @@ wfb chrome detach
 
 ## Data flow
 
-1. `launch` starts Chrome with `--remote-debugging-port`.
+1. `launch` first probes for an existing debug endpoint on the requested port; if missing, it starts Chrome with `--remote-debugging-port`.
 2. `targets` reads `/json/list`.
 3. `attach` stores selected target metadata at `~/.wfb/chrome_attachment.json`.
 4. `inspect` opens the target websocket and calls CDP `Runtime.evaluate`.
-5. `inspect` returns bounded JSON context (`url`, `title`, `selected_text`, `text_snapshot`).
+5. `inspect` returns bounded JSON context (`url`, `title`, `selected_text`, `text_snapshot`) where `text_snapshot` is truncated strictly by `--max-chars`.
 
 ## Troubleshooting
 

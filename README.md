@@ -160,6 +160,7 @@ Inspects a local session. Defaults to the active session.
 ### `wfb chrome launch [--port N] [--profile-mode isolated|user] [--chrome-path PATH]`
 
 Launches a Chrome instance with remote debugging enabled and verifies `/json/version`.
+If a debug endpoint is already available on the port, `wfb` reuses it and skips spawning a new process.
 
 - `--profile-mode isolated` (default): uses `~/.wfb/chrome_debug_profile/`.
 - `--profile-mode user`: uses your normal Chrome profile (higher fidelity, higher risk).
@@ -178,7 +179,7 @@ Reads bounded tab context from CDP `Runtime.evaluate` and prints JSON by default
 
 - `url`, `title`
 - `selected_text`
-- `text_snapshot` (bounded/truncated)
+- `text_snapshot` (bounded/truncated exactly by `--max-chars`)
 - capture metadata (`captured_at_unix`, length fields, target metadata)
 
 ### `wfb chrome detach`

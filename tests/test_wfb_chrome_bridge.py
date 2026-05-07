@@ -32,6 +32,36 @@ class _FakeSocket:
 
 
 class TestWfbChromeBridge(unittest.TestCase):
+    def test_launch_short_circuits_when_endpoint_exists(self):
+        with (
+            mock.patch.object(bridge, "fetch_version", return_value={"Browser": "Chrome/1"}) as fetch_version,
+            mock.patch.object(bridge, "find_chrome_executable") as find_chrome,
+            mock.patch.object(bridge.subprocess, "Popen") as popen,
+        ):
+            out = bridge.launch_chrome_debug(port=9222)
+        self.assertEqual(out["Browser"], "Chrome/1")
+        self.assertEqual(out["already_running"], True)
+        find_chrome.assert_not_called()
+        popen.assert_not_called()
+        fetch_version.assert_called_once()
+
+    def test_launch_spawns_when_endpoint_missing(self):
+        with (
+            mock.patch.object(
+                bridge,
+                "fetch_version",
+                side_effect=[bridge.ChromeBridgeError("no endpoint"), {"Browser": "Chrome/2"}],
+            ) as fetch_version,
+            mock.patch.object(bridge, "find_chrome_executable", return_value="/Applications/Chrome") as find_chrome,
+            mock.patch.object(bridge.subprocess, "Popen") as popen,
+        ):
+            out = bridge.launch_chrome_debug(port=9333, profile_mode="user")
+        self.assertEqual(out["already_running"], False)
+        self.assertEqual(out["debug_port"], 9333)
+        find_chrome.assert_called_once()
+        popen.assert_called_once()
+        self.assertEqual(fetch_version.call_count, 2)
+
     def test_encode_frame_masks_payload(self):
         frame = bridge._encode_ws_frame(b"hello", opcode=0x1, masked=True)
         self.assertEqual(frame[0] & 0x0F, 0x1)
@@ -61,6 +91,24 @@ class TestWfbChromeBridge(unittest.TestCase):
         out = conn.call("Runtime.evaluate", {"expression": "1+1"})
         self.assertEqual(out["value"], 42)
 
+    def test_recv_headers_and_remainder_keeps_buffered_bytes(self):
+        frame = bridge._encode_ws_frame(b'{"id":1,"result":{"ok":true}}', opcode=0x1, masked=False)
+        raw = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" + frame
+        sock = _FakeSocket([raw])
+        header_blob, remainder = bridge._recv_headers_and_remainder(sock)
+        self.assertIn("101", header_blob)
+        self.assertGreater(len(remainder), 0)
+        opcode, payload = bridge._decode_ws_frame(sock, recv_buffer=remainder)
+        self.assertEqual(opcode, 0x1)
+        self.assertTrue(json.loads(payload.decode("utf-8"))["result"]["ok"])
+
+    def test_recv_json_unexpected_opcode_raises(self):
+        binary_frame = bridge._encode_ws_frame(b"\x01\x02", opcode=0x2, masked=False)
+        conn = bridge.CDPConnection("ws://127.0.0.1:9222/devtools/page/abc")
+        conn._sock = _FakeSocket([binary_frame])
+        with self.assertRaises(bridge.ChromeBridgeError):
+            conn._recv_json()
+
     def test_inspect_target_extracts_value(self):
         fake_result = {
             "result": {
@@ -79,6 +127,28 @@ class TestWfbChromeBridge(unittest.TestCase):
         self.assertEqual(out["url"], "https://example.test")
         self.assertEqual(out["title"], "Example")
         self.assertEqual(out["text_snapshot"], "body text")
+
+    def test_inspect_target_applies_max_chars_exactly(self):
+        fake_result = {
+            "result": {
+                "value": {
+                    "url": "https://example.test",
+                    "title": "Example",
+                    "selected_text": "selection",
+                    "text_snapshot": "abcdefghij",
+                }
+            }
+        }
+        with mock.patch.object(bridge, "CDPConnection") as conn_cls:
+            cm = conn_cls.return_value.__enter__.return_value
+            cm.call.return_value = fake_result
+            out = bridge.inspect_target(
+                ws_url="ws://127.0.0.1:9222/devtools/page/x",
+                max_chars=4,
+            )
+        self.assertEqual(out["text_snapshot"], "abcd")
+        self.assertEqual(out["text_snapshot_chars"], 4)
+        self.assertEqual(out["text_snapshot_truncated"], True)
 
 
 if __name__ == "__main__":

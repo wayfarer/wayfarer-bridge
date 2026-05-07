@@ -702,6 +702,30 @@ class TestWfb(unittest.TestCase):
             self.assertEqual(rc, 0)
             inspect_target.assert_called_once()
 
+    def test_chrome_launch_reports_already_running(self):
+        payload = {"Browser": "Chrome/136", "already_running": True}
+        with mock.patch("wfb.launch_chrome_debug", return_value=payload):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["chrome", "launch", "--format", "text"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            self.assertIn("already_running: True", written)
+
+    def test_chrome_launch_rejects_invalid_timeout(self):
+        rc = wfb.main(["chrome", "launch", "--timeout-seconds", "0"])
+        self.assertEqual(rc, 2)
+
+    def test_chrome_detach_text(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.clear_attachment", return_value=True),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["chrome", "detach"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            self.assertIn("detached", written)
+
 
 if __name__ == "__main__":
     unittest.main()

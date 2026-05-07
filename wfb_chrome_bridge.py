@@ -132,6 +132,15 @@ def launch_chrome_debug(
     chrome_path: str | None = None,
     timeout_seconds: float = 12.0,
 ) -> dict[str, Any]:
+    try:
+        existing = fetch_version(port=port)
+        existing["debug_port"] = port
+        existing["profile_mode"] = profile_mode
+        existing["already_running"] = True
+        return existing
+    except ChromeBridgeError:
+        pass
+
     exe = find_chrome_executable(chrome_path)
     args = _chrome_launch_args(
         chrome_path=exe,
@@ -156,19 +165,12 @@ def launch_chrome_debug(
             ver = fetch_version(port=port)
             ver["debug_port"] = port
             ver["profile_mode"] = profile_mode
+            ver["already_running"] = False
             return ver
         except ChromeBridgeError as exc:
             last_error = exc
             time.sleep(0.2)
     raise ChromeBridgeError(f"Chrome debug endpoint not reachable on port {port}: {last_error}")
-
-
-def verify_debug_endpoint(
-    *, port: int = DEFAULT_DEBUG_PORT, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
-) -> dict[str, Any]:
-    ver = fetch_version(port=port, timeout_seconds=timeout_seconds)
-    ver["debug_port"] = port
-    return ver
 
 
 def _ws_accept_value(key: str) -> str:
@@ -187,6 +189,12 @@ def _recv_until(sock: socket.socket, marker: bytes, *, max_bytes: int = 32768) -
         if len(buf) > max_bytes:
             raise ChromeBridgeError("websocket handshake too large")
     return bytes(buf)
+
+
+def _recv_headers_and_remainder(sock: socket.socket) -> tuple[str, bytearray]:
+    raw = _recv_until(sock, b"\r\n\r\n")
+    head, tail = raw.split(b"\r\n\r\n", 1)
+    return head.decode("iso-8859-1"), bytearray(tail)
 
 
 def _encode_ws_frame(payload: bytes, *, opcode: int = 0x1, masked: bool = True) -> bytes:
@@ -215,8 +223,14 @@ def _encode_ws_frame(payload: bytes, *, opcode: int = 0x1, masked: bool = True) 
     return bytes(out)
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
+def _recv_exact(sock: socket.socket, n: int, *, recv_buffer: bytearray | None = None) -> bytes:
+    if recv_buffer is None:
+        recv_buffer = bytearray()
     out = bytearray()
+    if recv_buffer:
+        take = min(len(recv_buffer), n)
+        out.extend(recv_buffer[:take])
+        del recv_buffer[:take]
     while len(out) < n:
         chunk = sock.recv(n - len(out))
         if not chunk:
@@ -225,18 +239,18 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(out)
 
 
-def _decode_ws_frame(sock: socket.socket) -> tuple[int, bytes]:
-    hdr = _recv_exact(sock, 2)
+def _decode_ws_frame(sock: socket.socket, *, recv_buffer: bytearray | None = None) -> tuple[int, bytes]:
+    hdr = _recv_exact(sock, 2, recv_buffer=recv_buffer)
     b0, b1 = hdr[0], hdr[1]
     opcode = b0 & 0x0F
     masked = bool(b1 & 0x80)
     plen = b1 & 0x7F
     if plen == 126:
-        plen = int.from_bytes(_recv_exact(sock, 2), "big")
+        plen = int.from_bytes(_recv_exact(sock, 2, recv_buffer=recv_buffer), "big")
     elif plen == 127:
-        plen = int.from_bytes(_recv_exact(sock, 8), "big")
-    mask_key = _recv_exact(sock, 4) if masked else b""
-    payload = bytearray(_recv_exact(sock, plen))
+        plen = int.from_bytes(_recv_exact(sock, 8, recv_buffer=recv_buffer), "big")
+    mask_key = _recv_exact(sock, 4, recv_buffer=recv_buffer) if masked else b""
+    payload = bytearray(_recv_exact(sock, plen, recv_buffer=recv_buffer))
     if masked:
         for i in range(len(payload)):
             payload[i] ^= mask_key[i % 4]
@@ -251,6 +265,7 @@ class CDPConnection:
         self._timeout = timeout_seconds
         self._sock: socket.socket | None = None
         self._next_id = 1
+        self._recv_buffer = bytearray()
 
     def __enter__(self) -> "CDPConnection":
         self.connect()
@@ -280,8 +295,7 @@ class CDPConnection:
         sock = socket.create_connection((host, port), timeout=self._timeout)
         sock.settimeout(self._timeout)
         sock.sendall(req)
-        raw_resp = _recv_until(sock, b"\r\n\r\n")
-        header_blob = raw_resp.split(b"\r\n\r\n", 1)[0].decode("iso-8859-1")
+        header_blob, remainder = _recv_headers_and_remainder(sock)
         lines = header_blob.split("\r\n")
         status = lines[0] if lines else ""
         if "101" not in status:
@@ -297,6 +311,7 @@ class CDPConnection:
             sock.close()
             raise ChromeBridgeError("invalid websocket accept header")
         self._sock = sock
+        self._recv_buffer = remainder
 
     def close(self) -> None:
         if self._sock is not None:
@@ -318,13 +333,17 @@ class CDPConnection:
     def _recv_json(self) -> dict[str, Any]:
         sock = self._require_socket()
         while True:
-            opcode, payload = _decode_ws_frame(sock)
+            opcode, payload = _decode_ws_frame(sock, recv_buffer=self._recv_buffer)
             if opcode == 0x8:  # close
                 raise ChromeBridgeError("websocket closed by remote")
             if opcode == 0x9:  # ping
                 sock.sendall(_encode_ws_frame(payload, opcode=0xA, masked=True))
                 continue
+            if opcode == 0xA:  # pong
+                continue
             if opcode != 0x1:
+                raise ChromeBridgeError(f"unexpected websocket opcode: {opcode}")
+            if not payload:
                 continue
             try:
                 decoded = json.loads(payload.decode("utf-8"))
@@ -365,8 +384,8 @@ def inspect_target(
   return {
     url: String(location.href || ""),
     title: String(document.title || ""),
-    selected_text: selected.slice(0, 2000),
-    text_snapshot: text.slice(0, 20000)
+    selected_text: selected,
+    text_snapshot: text
   };
 })()
 """.strip()
