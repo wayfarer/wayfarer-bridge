@@ -635,6 +635,73 @@ class TestWfb(unittest.TestCase):
             rc = wfb.main(["gemini", "ask", "--prompt", "hello"])
             self.assertEqual(rc, 0)
 
+    def test_chrome_targets_json(self):
+        targets = [
+            {
+                "id": "t1",
+                "title": "One",
+                "url": "https://example.test/1",
+                "type": "page",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+            }
+        ]
+        with mock.patch("wfb.list_page_targets", return_value=targets):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["chrome", "targets", "--format", "json"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload[0]["id"], "t1")
+
+    def test_chrome_attach_persists_target(self):
+        targets = [
+            {
+                "id": "t1",
+                "title": "One",
+                "url": "https://example.test/1",
+                "type": "page",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+            }
+        ]
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.list_page_targets", return_value=targets),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}) as save_attach,
+        ):
+            rc = wfb.main(["chrome", "attach", "--target-id", "t1"])
+            self.assertEqual(rc, 0)
+            save_attach.assert_called_once()
+
+    def test_chrome_inspect_uses_saved_attachment(self):
+        targets = [
+            {
+                "id": "t1",
+                "title": "One",
+                "url": "https://example.test/1",
+                "type": "page",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+            }
+        ]
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+                    "debug_port": 9222,
+                },
+            ),
+            mock.patch("wfb.list_page_targets", return_value=targets),
+            mock.patch(
+                "wfb.inspect_target",
+                return_value={"title": "One", "url": "https://example.test/1", "text_snapshot": "abc"},
+            ) as inspect_target,
+        ):
+            rc = wfb.main(["chrome", "inspect", "--format", "json"])
+            self.assertEqual(rc, 0)
+            inspect_target.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

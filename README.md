@@ -18,10 +18,11 @@ Direct attachment to active browser Gemini side-panel sessions is not available 
 - `wfb gemini ask` sends prompts to Gemini with local session continuity.
 - `wfb gemini session ...` creates, switches, lists, resets, and inspects local chat sessions.
 - `wfb gemini ask --auto-summarize on` can compact long local sessions with a Gemini-generated summary.
+- `wfb chrome ...` can launch a debuggable Chrome instance, list page targets, attach one target, and inspect bounded tab text context.
 
-Not yet supported:
+Still not supported:
 
-- Direct connection to active Gemini browser tabs or side-panel sessions.
+- Direct official Gemini API attachment to browser side-panel sessions.
 - A centralized OAuth client secret for the open-source/PyPI path.
 
 ## Quick Start
@@ -74,6 +75,8 @@ wfb gemini session inspect --format json
 | `~/.wfb/token.json` | Local OAuth token cache. |
 | `~/.wfb/gemini_sessions/<session_id>.json` | Local Gemini chat session history and metadata. |
 | `~/.wfb/gemini_active_session.json` | Pointer to the current active Gemini session. |
+| `~/.wfb/chrome_debug_profile/` | Isolated Chrome profile dir for `wfb chrome launch --profile-mode isolated`. |
+| `~/.wfb/chrome_attachment.json` | Persisted selected Chrome target for `wfb chrome inspect`. |
 
 The global `--db PATH` flag overrides only the SQLite database path. Other CLI assets still live under `~/.wfb/`.
 
@@ -153,6 +156,34 @@ Clears message history for the target session. Defaults to the active session.
 ### `wfb gemini session inspect [--id SESSION_ID] [--format text|json]`
 
 Inspects a local session. Defaults to the active session.
+
+### `wfb chrome launch [--port N] [--profile-mode isolated|user] [--chrome-path PATH]`
+
+Launches a Chrome instance with remote debugging enabled and verifies `/json/version`.
+
+- `--profile-mode isolated` (default): uses `~/.wfb/chrome_debug_profile/`.
+- `--profile-mode user`: uses your normal Chrome profile (higher fidelity, higher risk).
+
+### `wfb chrome targets [--port N] [--format text|json]`
+
+Lists attachable `type=page` CDP targets from `/json/list`.
+
+### `wfb chrome attach --target-id ID [--port N] [--format text|json]`
+
+Stores the selected target in `~/.wfb/chrome_attachment.json` for later inspection.
+
+### `wfb chrome inspect [--target-id ID] [--port N] [--max-chars N] [--format text|json]`
+
+Reads bounded tab context from CDP `Runtime.evaluate` and prints JSON by default:
+
+- `url`, `title`
+- `selected_text`
+- `text_snapshot` (bounded/truncated)
+- capture metadata (`captured_at_unix`, length fields, target metadata)
+
+### `wfb chrome detach`
+
+Clears the persisted attachment file.
 
 ## Gemini Sessions For Agents
 
@@ -410,13 +441,16 @@ Top-level shape:
   - `wfb_oauth.py`: OAuth installed-app flow and token storage.
   - `wfb_gemini_api.py`: Gemini REST client, model calls, summarization.
   - `wfb_gemini_sessions.py`: local session storage and compaction helpers.
-  - `wfb_session_bridge.py`: manual browser-session attachment record helpers from earlier discovery work.
+  - `wfb_chrome_bridge.py`: stdlib CDP discovery, websocket, and page inspection helpers.
+  - `wfb_chrome_session.py`: persisted Chrome target attachment record helpers.
 
 The security posture is intentionally conservative: local-first, stdlib-only, no shared OSS OAuth client secret, and no vendored third-party libraries yet. A deeper security review is still future work.
 
 ## Known Limits / Next Work
 
 - No direct browser Gemini session attach through official API endpoints validated so far.
+- Chrome bridge is currently macOS-focused for launch ergonomics.
+- `wfb chrome inspect` is read-only text extraction only (no click/type/navigation automation).
 - No retry/backoff policy for transient Gemini `429` / `503` errors yet.
 - No tool/function-calling support yet.
 - Summarization thresholds are heuristic and should be adjusted with real usage.

@@ -32,4 +32,6 @@ py-modules = [
   "wfb_oauth",
   "wfb_gemini_api",
   "wfb_gemini_sessions",
+  "wfb_chrome_bridge",
+  "wfb_chrome_session",
 ]

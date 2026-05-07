@@ -25,3 +25,15 @@ def gemini_active_session_path(home: Path | None = None) -> Path:
     """Pointer file for currently active Gemini local session."""
     base = home if home is not None else wfb_home()
     return base / "gemini_active_session.json"
+
+
+def chrome_bridge_profile_dir(home: Path | None = None) -> Path:
+    """Default isolated Chrome profile directory for remote debugging."""
+    base = home if home is not None else wfb_home()
+    return base / "chrome_debug_profile"
+
+
+def chrome_bridge_attachment_path(home: Path | None = None) -> Path:
+    """Persisted selected Chrome target for bridge inspect calls."""
+    base = home if home is not None else wfb_home()
+    return base / "chrome_attachment.json"

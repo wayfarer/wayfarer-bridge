@@ -13,6 +13,15 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from wfb_chrome_bridge import (
+    DEFAULT_DEBUG_PORT,
+    ChromeBridgeError,
+    choose_target,
+    inspect_target,
+    launch_chrome_debug,
+    list_page_targets,
+)
+from wfb_chrome_session import clear_attachment, load_attachment as load_chrome_attachment, save_attachment
 from wfb_db import UPDATED_AT_SQL, connect_db, init_db, require_v1_schema
 from wfb_gemini_api import (
     DEFAULT_MODEL,
@@ -45,7 +54,7 @@ from wfb_oauth import (
     print_oauth_setup_instructions,
     OAuthFlowError,
 )
-from wfb_paths import default_db_path, wfb_home
+from wfb_paths import chrome_bridge_profile_dir, default_db_path, wfb_home
 
 # --- Exit codes (README) ---
 EXIT_OK = 0
@@ -799,6 +808,70 @@ def build_parser() -> argparse.ArgumentParser:
     insp = sess_sub.add_parser("inspect", help="print session record")
     insp.add_argument("--id", help="session id (defaults to active session)")
     insp.add_argument("--format", choices=("text", "json"), default="text")
+
+    chrome = sub.add_parser("chrome", help="Chrome remote debugging bridge commands")
+    chrome_sub = chrome.add_subparsers(dest="chrome_command", required=True)
+
+    c_launch = chrome_sub.add_parser("launch", help="launch or verify debuggable Chrome")
+    c_launch.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_DEBUG_PORT,
+        help=f"remote debugging port (default: {DEFAULT_DEBUG_PORT})",
+    )
+    c_launch.add_argument(
+        "--profile-mode",
+        choices=("isolated", "user"),
+        default="isolated",
+        help="profile strategy (default: isolated)",
+    )
+    c_launch.add_argument("--chrome-path", help="explicit Chrome executable path")
+    c_launch.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=12.0,
+        help="launch/verify timeout seconds (default: 12.0)",
+    )
+    c_launch.add_argument("--format", choices=("text", "json"), default="text")
+
+    c_targets = chrome_sub.add_parser("targets", help="list attachable Chrome page targets")
+    c_targets.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_DEBUG_PORT,
+        help=f"remote debugging port (default: {DEFAULT_DEBUG_PORT})",
+    )
+    c_targets.add_argument("--format", choices=("text", "json"), default="text")
+
+    c_attach = chrome_sub.add_parser("attach", help="persist selected Chrome target")
+    c_attach.add_argument("--target-id", required=True, help="target id from chrome targets output")
+    c_attach.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_DEBUG_PORT,
+        help=f"remote debugging port (default: {DEFAULT_DEBUG_PORT})",
+    )
+    c_attach.add_argument("--format", choices=("text", "json"), default="text")
+
+    c_inspect = chrome_sub.add_parser("inspect", help="inspect attached Chrome target content")
+    c_inspect.add_argument("--target-id", help="override persisted target id for this call")
+    c_inspect.add_argument("--port", type=int, help="override debug port")
+    c_inspect.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=5.0,
+        help="CDP request timeout seconds (default: 5.0)",
+    )
+    c_inspect.add_argument(
+        "--max-chars",
+        type=int,
+        default=4000,
+        help="max snapshot text chars (default: 4000)",
+    )
+    c_inspect.add_argument("--format", choices=("text", "json"), default="json")
+
+    c_detach = chrome_sub.add_parser("detach", help="clear persisted Chrome target attachment")
+    c_detach.add_argument("--format", choices=("text", "json"), default="text")
     p.set_defaults(
         file=None,
         json_data=None,
@@ -1097,6 +1170,163 @@ def main(argv: list[str] | None = None) -> int:
                             print(f"summaries: {summary_count}")
                     return EXIT_OK
         except (GeminiApiError, OAuthFlowError) as e:
+            _err(str(e))
+            return EXIT_IO
+
+    if args.command == "chrome":
+        try:
+            if args.chrome_command == "launch":
+                if args.port <= 0:
+                    _err("--port must be positive")
+                    return EXIT_USAGE
+                if args.timeout_seconds <= 0:
+                    _err("--timeout-seconds must be positive")
+                    return EXIT_USAGE
+                wfb_home().mkdir(parents=True, exist_ok=True)
+                profile_dir = None
+                if args.profile_mode == "isolated":
+                    profile_dir = str(chrome_bridge_profile_dir(wfb_home()))
+                payload = launch_chrome_debug(
+                    port=args.port,
+                    profile_mode=args.profile_mode,
+                    profile_dir=profile_dir,
+                    chrome_path=args.chrome_path,
+                    timeout_seconds=args.timeout_seconds,
+                )
+                if args.format == "json":
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    browser = payload.get("Browser", "unknown")
+                    print(f"Chrome debug ready on port {args.port}")
+                    print(f"Browser: {browser}")
+                    print(f"profile_mode: {args.profile_mode}")
+                return EXIT_OK
+
+            if args.chrome_command == "targets":
+                if args.port <= 0:
+                    _err("--port must be positive")
+                    return EXIT_USAGE
+                targets = list_page_targets(port=args.port)
+                if args.format == "json":
+                    out = []
+                    for t in targets:
+                        out.append(
+                            {
+                                "id": t.get("id"),
+                                "title": t.get("title"),
+                                "url": t.get("url"),
+                                "type": t.get("type"),
+                                "webSocketDebuggerUrl": t.get("webSocketDebuggerUrl"),
+                            }
+                        )
+                    print(json.dumps(out, indent=2, sort_keys=True))
+                else:
+                    if not targets:
+                        print("No page targets.")
+                    for t in targets:
+                        print(
+                            f"{t.get('id','')}\t{t.get('title','')}\t{t.get('url','')}\ttype={t.get('type','')}"
+                        )
+                return EXIT_OK
+
+            if args.chrome_command == "attach":
+                if args.port <= 0:
+                    _err("--port must be positive")
+                    return EXIT_USAGE
+                targets = list_page_targets(port=args.port)
+                target = choose_target(targets, args.target_id)
+                ws_url = str(target.get("webSocketDebuggerUrl", ""))
+                if not ws_url:
+                    _err(f"target missing websocket debugger url: {args.target_id}")
+                    return EXIT_IO
+                payload = save_attachment(
+                    wfb_home(),
+                    target_id=str(target.get("id", "")),
+                    ws_url=ws_url,
+                    url=str(target.get("url", "")),
+                    title=str(target.get("title", "")),
+                    debug_port=args.port,
+                )
+                if args.format == "json":
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    print(f"attached {payload['target_id']}")
+                return EXIT_OK
+
+            if args.chrome_command == "inspect":
+                if args.max_chars <= 0:
+                    _err("--max-chars must be positive")
+                    return EXIT_USAGE
+                if args.timeout_seconds <= 0:
+                    _err("--timeout-seconds must be positive")
+                    return EXIT_USAGE
+                target: dict[str, Any] | None = None
+                ws_url = ""
+                target_id = args.target_id
+                port = args.port
+                targets: list[dict[str, Any]] = []
+
+                if target_id:
+                    resolved_port = port if port is not None else DEFAULT_DEBUG_PORT
+                    targets = list_page_targets(port=resolved_port)
+                    target = choose_target(targets, target_id)
+                    ws_url = str(target.get("webSocketDebuggerUrl", ""))
+                    port = resolved_port
+                else:
+                    attachment = load_chrome_attachment(wfb_home())
+                    if attachment is None:
+                        _err("no attached Chrome target; run `wfb chrome attach --target-id ...`")
+                        return EXIT_IO
+                    ws_url = str(attachment.get("webSocketDebuggerUrl", ""))
+                    target_id = str(attachment.get("target_id", ""))
+                    if port is None:
+                        saved_port = attachment.get("debug_port")
+                        if isinstance(saved_port, int):
+                            port = saved_port
+                        else:
+                            port = DEFAULT_DEBUG_PORT
+                    targets = list_page_targets(port=port)
+                    target = choose_target(targets, target_id)
+
+                if not ws_url:
+                    _err("target has no websocket debugger url")
+                    return EXIT_IO
+
+                context = inspect_target(
+                    ws_url=ws_url,
+                    timeout_seconds=args.timeout_seconds,
+                    max_chars=args.max_chars,
+                )
+                if target is not None:
+                    context["target"] = {
+                        "id": str(target.get("id", "")),
+                        "title": str(target.get("title", "")),
+                        "url": str(target.get("url", "")),
+                        "type": str(target.get("type", "")),
+                    }
+                if port is not None:
+                    context["debug_port"] = int(port)
+                if args.format == "json":
+                    print(json.dumps(context, indent=2, sort_keys=True))
+                else:
+                    print(f"title: {context.get('title','')}")
+                    print(f"url: {context.get('url','')}")
+                    print(f"text_snapshot_chars: {context.get('text_snapshot_chars', 0)}")
+                    print(context.get("text_snapshot", ""))
+                return EXIT_OK
+
+            if args.chrome_command == "detach":
+                removed = clear_attachment(wfb_home())
+                payload = {"detached": removed}
+                if args.format == "json":
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    if removed:
+                        print("detached")
+                    else:
+                        print("no attachment")
+                return EXIT_OK
+        except ChromeBridgeError as e:
             _err(str(e))
             return EXIT_IO
 
