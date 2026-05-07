@@ -1,142 +1,269 @@
 # wayfarer-bridge
 
-Wayfarer Bridge is a **Relational Context Store**: a lightweight **Python standard library–only** (`sqlite3`, `json`, `argparse`) shim that holds structured world state for terminal-based agents (Cursor, Claude Code, etc.). The canonical CLI binary name is **`wfb`**.
+Wayfarer Bridge (`wfb`) is a local, Python standard library-only CLI for moving useful context between terminal agents and Gemini. It is intentionally small: local files, SQLite, OAuth, and raw Gemini REST calls with no external Python package dependencies.
 
-This document freezes **v1** so implementation can proceed without reinterpretation.
+The project currently has two working context channels:
 
----
+- **World state:** a local SQLite store for structured tasks, constraints, and style rules (`wfb seed`, `wfb status`).
+- **Gemini chat memory:** local Gemini session files that make repeated `wfb gemini ask` calls coherent across turns (`wfb gemini session`, `wfb gemini ask`).
 
-## v1 CLI surface
+Direct attachment to active browser Gemini side-panel sessions is not available through the validated official Gemini API surface today. For now, `wfb` uses local session memory as the bridgeable, agent-friendly fallback.
 
-### CLI asset directory
+## What Works Today
 
-- Default **`~/.wfb/`** is the per-user **CLI asset directory** for all tools-managed files today and in the future (additional config/cache/log files could live beside the DB later).
-- The default relational store is **`~/.wfb/wayfarer.db`**.
-- **`--db PATH`** overrides only the SQLite file path (for projects, backups, tests, etc.). The asset-directory convention still applies when you omit `--db`.
+- `wfb init` creates the local asset directory, initializes the SQLite DB, and runs OAuth login.
+- `wfb seed` ingests a structured world-state JSON envelope into SQLite.
+- `wfb status` prints a concise world-state summary in text or JSON.
+- `wfb gemini ping` verifies authenticated Gemini API access.
+- `wfb gemini ask` sends prompts to Gemini with local session continuity.
+- `wfb gemini session ...` creates, switches, lists, resets, and inspects local chat sessions.
+- `wfb gemini ask --auto-summarize on` can compact long local sessions with a Gemini-generated summary.
 
-### `wfb init [--db PATH] [--no-browser] [--force-login]`
+Not yet supported:
 
-- Requires a local OAuth desktop client secret at **`~/.wfb/client_secret.json`** for the OSS/PyPI build.
-- If missing, `init` always prints setup instructions and the official OAuth guide URL, then attempts to open the guide in your browser.
-- Ensures **`~/.wfb/` exists** (`mkdir -p`), then applies the v1 schema to the target database (default `~/.wfb/wayfarer.db`).
-- Creates the DB file at `PATH` when missing.
-- Runs OAuth login and stores credentials at **`~/.wfb/token.json`**.
-- `--no-browser` prints the auth URL instead of attempting browser-open.
-- `--force-login` ignores any cached token and reruns login.
-- **Idempotent:** safe to run multiple times (`CREATE TABLE IF NOT EXISTS`, etc.).
-- Ensures `schema_version` reflects v1 after successful init.
+- Packaged install / console entry point. For now, use an alias or run `python3 wfb.py`.
+- Direct connection to active Gemini browser tabs or side-panel sessions.
+- A centralized OAuth client secret for the open-source/PyPI path.
 
-### `wfb seed (--json STRING | --file PATH) [--db PATH] [--replace]`
+## Quick Start
 
-- Ingests a **seed envelope** (JSON).
-- **`--replace`:** before inserting, deletes all rows from `active_tasks`, `environmental_constraints`, and `style_specifications`; then inserts the envelope contents. Omit for **upsert** behavior.
-- **Upsert (default):** for each row, insert or replace by **`id`** (see [Upsert semantics](#upsert-semantics)).
-- Entire ingest runs in **one transaction** commit or rollback on error.
+From the repository root, either run the script directly:
 
-### `wfb status [--db PATH] [--format text|json] [--limit N]`
+```sh
+python3 wfb.py --help
+```
 
-- Summarizes current world state from the DB.
-- **`--format text`** (default): concise, agent-readable summary.
-- **`--format json`:** deterministic machine-readable snapshot (shape below).
-- **`--limit N`:** caps list previews in text mode (default **5**); applies to highlighted rows where lists are truncated.
+Or create a local alias:
+
+```sh
+alias wfb='python3 /path/to/wayfarer-bridge/wfb.py'
+```
+
+Set up OAuth:
+
+1. Create a Google Cloud project and enable the Generative Language API.
+2. Configure the OAuth consent screen and add yourself as a test user while developing.
+3. Create an OAuth **Desktop app** client.
+4. Download the JSON and place it at `~/.wfb/client_secret.json`.
+5. Run `wfb init`, then `wfb gemini ping`.
+
+Create a Gemini session and ask follow-up questions:
+
+```sh
+wfb gemini session new --name planning
+wfb gemini ask --prompt "Remember that Wayfarer Bridge is stdlib-only."
+wfb gemini ask --prompt "What constraint did I just mention?"
+wfb gemini session inspect --format json
+```
+
+## Asset Layout
+
+`~/.wfb/` is the canonical per-user asset directory.
+
+| Path | Purpose |
+|---|---|
+| `~/.wfb/wayfarer.db` | Default SQLite world-state database. |
+| `~/.wfb/client_secret.json` | User-provided OAuth Desktop client secret. |
+| `~/.wfb/token.json` | Local OAuth token cache. |
+| `~/.wfb/gemini_sessions/<session_id>.json` | Local Gemini chat session history and metadata. |
+| `~/.wfb/gemini_active_session.json` | Pointer to the current active Gemini session. |
+
+The global `--db PATH` flag overrides only the SQLite database path. Other CLI assets still live under `~/.wfb/`.
+
+## CLI Reference
+
+Global option:
+
+```sh
+wfb [--db PATH] <command> ...
+```
+
+### `wfb init [--no-open-oauth-guide] [--no-browser] [--force-login]`
+
+- Ensures `~/.wfb/` exists.
+- Initializes the SQLite schema at `--db PATH` or `~/.wfb/wayfarer.db`.
+- Requires `~/.wfb/client_secret.json`.
+- Runs OAuth login and stores token data at `~/.wfb/token.json`.
+- `--no-open-oauth-guide` disables best-effort browser-open for setup instructions.
+- `--no-browser` prints the OAuth URL instead of attempting to open a browser.
+- `--force-login` ignores a valid cached token and reruns OAuth.
+
+### `wfb seed (--json STRING | --file PATH) [--replace]`
+
+Ingests a structured world-state envelope into SQLite. Default behavior is upsert by `id`; `--replace` clears all entity tables before inserting the supplied envelope.
+
+### `wfb status [--format text|json] [--limit N]`
+
+Prints the SQLite world-state summary. `--format json` emits deterministic machine-readable state; `--limit N` caps preview lists in text output.
 
 ### `wfb gemini ping [--limit N]`
 
-- Uses cached OAuth credentials from `~/.wfb/token.json`.
-- Calls Gemini REST models endpoint and prints model count + names.
-- Useful as an authenticated connectivity smoke test.
+Lists available Gemini model names using cached OAuth credentials.
 
-### `wfb gemini ask --prompt STRING [--model ID] [--session ID] [--max-history-turns N] [--system TEXT] [--auto-summarize on|off] [--summarize-model ID]`
+### `wfb gemini ask --prompt STRING [options]`
 
-- Uses local hybrid session memory by default:
-  - active session is used implicitly,
-  - if none exists, one is auto-created.
-- Appends user and model turns to local session history.
-- Sends history (bounded by `--max-history-turns`) to Gemini `generateContent`.
-- `--session` explicitly routes one ask to a specific local session.
-- `--system` overrides system instruction for the current call.
-- `--auto-summarize on|off` controls model-based pre-ask compaction (default: `off`).
-- `--summarize-model` optionally uses a different Gemini model specifically for summary generation.
-- Default model: `gemini-2.5-flash`.
+Sends a prompt to Gemini using local session memory.
 
-### `wfb gemini session ...`
+Options:
 
-- `wfb gemini session current` shows the active session id.
-- `wfb gemini session list` lists all local sessions (`*` marks active).
-- `wfb gemini session new [--name ...] [--model ...] [--system ...]` creates + activates.
-- `wfb gemini session use --id ...` activates an existing session.
-- `wfb gemini session reset [--id ...]` clears only that session's turn history.
-- `wfb gemini session inspect [--id ...] [--format text|json]` inspects a session.
+- `--model ID`: Gemini model id. Default: `gemini-2.5-flash`.
+- `--session ID`: route this ask to a specific local session. Defaults to the active session.
+- `--max-history-turns N`: include at most this many recent non-summary turns. Default: `30`.
+- `--system TEXT`: system instruction override for this call.
+- `--auto-summarize on|off`: opt into model-generated session compaction. Default: `off`.
+- `--summarize-model ID`: optional model override used only for summary generation.
+- `--sync-world-state on|off`: per-ask override for world-state sync.
+- `--world-state-db PATH`: per-ask override for sync target DB.
 
-Optional future commands (`export`, `validate`) remain out of scope for this stage.
+If no active session exists, `ask` auto-creates one.
 
----
+### `wfb gemini session current`
 
-## OAuth setup prerequisite (OSS/PyPI)
+Prints the active local Gemini session id, if any.
 
-The open-source `wfb` CLI does **not** ship centralized OAuth client secrets. You must provide your own Desktop OAuth client JSON at:
+### `wfb gemini session list`
 
-- **`~/.wfb/client_secret.json`**
+Lists local sessions. The active session is marked with `*`.
 
-Setup reference:
+### `wfb gemini session new [--name NAME] [--model ID] [--system TEXT] [sync options]`
+
+Creates a new local session and makes it active.
+
+Sync options:
+
+- `--sync-world-state on|off`: default sync mode for this session.
+- `--world-state-db PATH`: default target DB for this session's sync.
+- `--world-state-scope TEXT`: optional scope tag injected into synced record metadata.
+
+### `wfb gemini session use --id SESSION_ID [sync options]`
+
+Makes an existing session active.
+
+### `wfb gemini session reset [--id SESSION_ID]`
+
+Clears message history for the target session. Defaults to the active session.
+
+### `wfb gemini session inspect [--id SESSION_ID] [--format text|json]`
+
+Inspects a local session. Defaults to the active session.
+
+## Gemini Sessions For Agents
+
+The Gemini REST calls used by `wfb` do not return a reusable API-managed conversation handle. See `docs/gemini_session_discovery.md` for the discovery notes.
+
+`wfb` therefore maintains local session history:
+
+```mermaid
+flowchart TD
+    askCmd[geminiAsk] --> loadSession[loadLocalSession]
+    loadSession --> buildPrompt[buildPromptHistory]
+    buildPrompt --> geminiApi[GeminiGenerateContent]
+    geminiApi --> appendTurns[appendUserAndModelTurns]
+    appendTurns --> saveSession[saveLocalSession]
+```
+
+Session behavior:
+
+- `wfb gemini ask` targets the active session by default.
+- `--session ID` overrides routing for one call and makes that session active.
+- Each successful ask appends both the user prompt and Gemini response.
+- `session inspect --format json` exposes the stored history for orchestration.
+- `session reset` clears a session without deleting the session file.
+
+## Chat To World-State Sync
+
+`wfb` can distill chat context into the SQLite world-state store after successful asks.
+
+Mode and source of truth:
+
+- Chat is primary context.
+- World state is extracted, structured output.
+- Sync is session-default configurable and per-ask overridable.
+
+Enable sync by default for a session:
+
+```sh
+wfb gemini session new --name triage --sync-world-state on
+```
+
+Or update an existing session:
+
+```sh
+wfb gemini session use --id sess_abc --sync-world-state on --world-state-db ~/.wfb/wayfarer.db --world-state-scope triage
+```
+
+Override for a single ask:
+
+```sh
+wfb gemini ask --prompt "..." --sync-world-state on --world-state-db ~/.wfb/wayfarer.db
+```
+
+Pipeline:
+
+1. `ask` gets model response and persists chat turns.
+2. If sync is enabled, `wfb` asks Gemini to emit a strict v1 seed envelope JSON.
+3. Envelope is validated with the same `seed` validators.
+4. Valid rows are upserted into the target DB via `seed_db(...)`.
+
+Failure semantics:
+
+- Sync failures are non-fatal for chat continuity.
+- Ask still succeeds and prints response.
+- Sync failures are emitted as deterministic warnings to stderr.
+
+### Session Summarization
+
+Summarization is opt-in:
+
+```sh
+wfb gemini ask --auto-summarize on --prompt "continue"
+```
+
+When enabled and a session exceeds model-aware drift thresholds, `wfb` asks Gemini to summarize older turns. It then stores a synthetic `history_summary` message plus recent raw turns.
+
+Important safety details:
+
+- Summaries are Gemini-generated only; there is no deterministic fallback.
+- If summary generation fails, `ask` fails and reports the API error.
+- Compacted state is persisted only after the final ask succeeds, so transient final-call failures do not overwrite raw history.
+- Summary artifacts are always included in prompt history even when `--max-history-turns` trims older ordinary turns.
+- Thresholds are drift heuristics, not hard Gemini context-window limits.
+
+## OAuth Setup
+
+The open-source `wfb` CLI does not ship a centralized OAuth client secret. Users provide their own Desktop OAuth client JSON at:
+
+```text
+~/.wfb/client_secret.json
+```
+
+Reference:
 
 - [Gemini OAuth quickstart](https://ai.google.dev/gemini-api/docs/oauth)
-
-Minimum steps:
-
-1. Create a Google Cloud project and enable the Generative Language API.
-2. Configure OAuth consent screen and add yourself as a test user while developing.
-3. Create an OAuth **Desktop app** client, download the JSON, and place it at `~/.wfb/client_secret.json`.
-4. Run `wfb init` again.
-
-After successful login, `wfb` stores OAuth tokens locally at:
-
-- **`~/.wfb/token.json`**
 
 Troubleshooting:
 
 - If browser-open fails, copy/paste the printed auth URL manually.
 - For headless/manual environments, run `wfb init --no-browser`.
-- If API calls fail after some time due to token refresh issues, rerun `wfb init --force-login` to refresh local credentials.
-- In testing-mode OAuth projects, `refresh_token_expires_in` may be short (e.g. about 7 days), which requires periodic re-login.
+- If token refresh fails, rerun `wfb init --force-login`.
+- In testing-mode OAuth projects, refresh tokens may expire periodically and require re-login.
 
----
+## World-State Reference
 
-## Gemini Sessions For Agents
+The SQLite world-state store is the original relational context channel. It is useful for durable, structured facts that agents should be able to query or summarize without replaying chat history.
 
-API-managed reusable conversation handles are currently treated as unsupported in `wfb`'s active Gemini REST surface; see `docs/gemini_session_discovery.md`.
+### Seed Envelope
 
-Agent-first workflow:
+Top-level JSON object:
 
-1. `wfb gemini session new --name planning`
-2. `wfb gemini ask --prompt "first prompt"`
-3. `wfb gemini ask --prompt "follow-up prompt"` (same context by default)
-4. `wfb gemini session inspect --format json` (deterministic state for orchestration)
-5. `wfb gemini session reset` when you want a clean context window
-
-### Session Summarization
-
-- Long sessions can be compacted before `ask` using a Gemini-generated summary (`--auto-summarize on`).
-- Trigger thresholds are model-aware drift heuristics (`flash-lite`, `flash`, `pro`, fallback policy), not hard context-window limits.
-- Compaction preserves recent turns and replaces older turns with a `history_summary` message.
-- No deterministic fallback is used.
-- If compaction is required and summary generation fails, `wfb gemini ask` fails with an error (hard-fail).
-- Safety behavior: compacted state is only persisted after the final ask succeeds, so transient failures do not overwrite raw history.
-
----
-
-## Canonical seed envelope (JSON)
-
-Top-level object:
-
-| Field                         | Required | Notes |
-|------------------------------|----------|--------|
-| `version`                     | Yes      | Integer; must equal **1** for v1 envelopes. |
-| `generated_at`                | No       | ISO-8601 UTC string (recommended). |
-| `source`                      | No       | Short string naming origin (e.g. `gemini`, `cursor`). |
-| `active_tasks`               | No       | Array; omit or `[]` for none. |
-| `environmental_constraints`   | No       | Array; omit or `[]` for none. |
-| `style_specifications`       | No       | Array; omit or `[]` for none. |
+| Field | Required | Notes |
+|---|---:|---|
+| `version` | Yes | Integer; must equal `1`. |
+| `generated_at` | No | ISO-8601 UTC string recommended. |
+| `source` | No | Short origin label, e.g. `gemini` or `cursor`. |
+| `active_tasks` | No | Array; omit or `[]` for none. |
+| `environmental_constraints` | No | Array; omit or `[]` for none. |
+| `style_specifications` | No | Array; omit or `[]` for none. |
 
 Example:
 
@@ -151,139 +278,76 @@ Example:
 }
 ```
 
----
+### Record Shapes
 
-## Record shapes and validation
+Validation runs before any DB writes. `metadata`, when present, must be a JSON object and is stored as compact JSON text in `metadata_json`.
 
-Validation runs before any DB writes. **`metadata`** (when present) must be a JSON object at parse time; it is stored as a compact JSON string in `metadata_json` columns (`json.dumps(..., separators=(",", ":"))`).
+#### `active_tasks[]`
 
-### `active_tasks[]`
+| Field | Required | Type | Constraints |
+|---|---:|---|---|
+| `id` | Yes | string | Primary upsert key. |
+| `title` | Yes | string | |
+| `status` | Yes | string | One of `pending`, `in_progress`, `blocked`, `done`. |
+| `priority` | No | int | Default `0`. |
+| `owner` | No | string | |
+| `due_at` | No | string | ISO-8601 recommended. |
+| `notes` | No | string | |
+| `source` | No | string | Overrides envelope `source`. |
+| `metadata` | No | object | |
 
-| Field       | Required | Type   | Constraints |
-|------------|----------|--------|--------------|
-| `id`       | Yes      | string | Primary upsert key. |
-| `title`    | Yes      | string | |
-| `status`   | Yes      | string | One of: `pending`, `in_progress`, `blocked`, `done`. |
-| `priority`| No       | int    | Default **0**. |
-| `owner`    | No       | string | |
-| `due_at`   | No       | string | ISO-8601 recommended. |
-| `notes`    | No       | string | |
-| `source`   | No       | string | Overrides envelope `source` for this row when present. |
-| `metadata` | No       | object | |
+#### `environmental_constraints[]`
 
-### `environmental_constraints[]`
+| Field | Required | Type | Constraints |
+|---|---:|---|---|
+| `id` | Yes | string | Primary upsert key. |
+| `kind` | Yes | string | One of `tool_version_warning`, `policy`, `runtime_limit`, `dependency`, `other`. |
+| `name` | Yes | string | |
+| `value` | Yes | string | |
+| `severity` | Yes | string | One of `info`, `warn`, `error`. |
+| `scope` | No | string | e.g. `global`, `repo`, `task:<id>`. |
+| `source` | No | string | Overrides envelope `source`. |
+| `metadata` | No | object | |
 
-| Field       | Required | Type   | Constraints |
-|------------|----------|--------|--------------|
-| `id`       | Yes      | string | Primary upsert key. |
-| `kind`     | Yes      | string | One of: `tool_version_warning`, `policy`, `runtime_limit`, `dependency`, `other`. |
-| `name`     | Yes      | string | |
-| `value`    | Yes      | string | |
-| `severity` | Yes      | string | One of: `info`, `warn`, `error`. |
-| `scope`    | No       | string | e.g. `global`, `repo`, `task:<id>`. |
-| `source`   | No       | string | Overrides envelope `source` for this row when present. |
-| `metadata` | No       | object | |
+#### `style_specifications[]`
 
-### `style_specifications[]`
+| Field | Required | Type | Constraints |
+|---|---:|---|---|
+| `id` | Yes | string | Primary upsert key. |
+| `category` | Yes | string | One of `tone`, `formatting`, `coding_style`, `workflow`, `other`. |
+| `rule` | Yes | string | |
+| `priority` | No | int | Default `0`. |
+| `applies_to` | No | string | e.g. `all`, `python`, `docs`. |
+| `source` | No | string | Overrides envelope `source`. |
+| `metadata` | No | object | |
 
-| Field         | Required | Type   | Constraints |
-|---------------|----------|--------|--------------|
-| `id`          | Yes      | string | Primary upsert key. |
-| `category`    | Yes      | string | One of: `tone`, `formatting`, `coding_style`, `workflow`, `other`. |
-| `rule`        | Yes      | string | |
-| `priority`    | No       | int    | Default **0**. |
-| `applies_to`  | No       | string | e.g. `all`, `python`, `docs`. |
-| `source`      | No       | string | Overrides envelope `source` for this row when present. |
-| `metadata`    | No       | object | |
+### Upsert Semantics
 
-### Upsert semantics
+- Rows are inserted or updated by `id`.
+- `updated_at` is refreshed on every successful write.
+- Row `source` uses item `source`, then envelope `source`, then `NULL`.
+- Unknown top-level envelope keys are rejected.
+- Unknown keys inside entity records are rejected.
 
-- Default mode: **`INSERT … ON CONFLICT(id) DO UPDATE`** for each table row.
-- **`updated_at`** is set on every successful write for that row (`strftime('%Y-%m-%dT%H:%M:%fZ','now')` UTC).
-- Row **`source`:** use the item’s `source` if present; otherwise use the envelope’s `source` if present; otherwise `NULL`.
-- Unknown extra keys **at the envelope top level**: **reject** (only keys listed in [Canonical seed envelope](#canonical-seed-envelope-json) are allowed).
-- Unknown keys **inside array items**: **reject**. Allowed keys per type:
-  - `active_tasks`: `id`, `title`, `status`, `priority`, `owner`, `due_at`, `notes`, `source`, `metadata`.
-  - `environmental_constraints`: `id`, `kind`, `name`, `value`, `severity`, `scope`, `source`, `metadata`.
-  - `style_specifications`: `id`, `category`, `rule`, `priority`, `applies_to`, `source`, `metadata`.
+### SQLite Schema
 
----
+`wfb init` creates a v1 schema with one `schema_version` row and three entity tables:
 
-## SQLite schema v1 (`schema_version` + DDL)
+- `active_tasks`
+- `environmental_constraints`
+- `style_specifications`
 
-v1 does not define foreign keys between entity tables. Run `PRAGMA foreign_keys = ON;` once when opening the DB (recommended).
+Indexes:
 
-Exactly one semantics for **`schema_version`:** after `wfb init`, there is one row with `version = 1`. Init must insert that row if the table is empty (v1 is the initial schema; no migrations yet).
+- `idx_active_tasks_status`
+- `idx_constraints_severity`
+- `idx_style_priority`
 
-Full v1 DDL:
+The implementation source of truth is `wfb_db.py`.
 
-```sql
-PRAGMA foreign_keys = ON;
+### `wfb status --format json`
 
-CREATE TABLE IF NOT EXISTS schema_version (
-  version INTEGER NOT NULL,
-  applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-
-CREATE TABLE IF NOT EXISTS active_tasks (
-  id TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('pending','in_progress','blocked','done')),
-  priority INTEGER NOT NULL DEFAULT 0,
-  owner TEXT,
-  due_at TEXT,
-  notes TEXT,
-  source TEXT,
-  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  metadata_json TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE TABLE IF NOT EXISTS environmental_constraints (
-  id TEXT PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('tool_version_warning','policy','runtime_limit','dependency','other')),
-  name TEXT NOT NULL,
-  value TEXT NOT NULL,
-  severity TEXT NOT NULL CHECK (severity IN ('info','warn','error')),
-  scope TEXT,
-  source TEXT,
-  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  metadata_json TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE TABLE IF NOT EXISTS style_specifications (
-  id TEXT PRIMARY KEY,
-  category TEXT NOT NULL CHECK (category IN ('tone','formatting','coding_style','workflow','other')),
-  rule TEXT NOT NULL,
-  priority INTEGER NOT NULL DEFAULT 0,
-  applies_to TEXT,
-  source TEXT,
-  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  metadata_json TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE INDEX IF NOT EXISTS idx_active_tasks_status ON active_tasks(status);
-CREATE INDEX IF NOT EXISTS idx_constraints_severity ON environmental_constraints(severity);
-CREATE INDEX IF NOT EXISTS idx_style_priority ON style_specifications(priority DESC);
-```
-
----
-
-## `wfb status` output contract
-
-### Text (default)
-
-Include, in order:
-
-1. **Header:** resolved `db` path and current generation timestamp (ISO-8601 UTC).
-2. **Counts:** tasks by `status`; constraints by `severity`; count of style rules.
-3. **In progress / blocked:** up to `--limit` tasks, ordered by `priority` desc then `updated_at` desc.
-4. **Warnings / errors:** constraints with `severity` in `warn`, `error` (up to `--limit`), ordered by severity then `updated_at` desc.
-5. **Style rules:** up to `--limit` rows by `priority` desc, then `updated_at` desc.
-6. **Last updated:** max(`updated_at`) per table (`active_tasks`, `environmental_constraints`, `style_specifications`).
-
-### JSON (`--format json`)
-
-Top-level shape (field order not normative; keys must exist):
+Top-level shape:
 
 ```json
 {
@@ -316,30 +380,37 @@ Top-level shape (field order not normative; keys must exist):
 }
 ```
 
-- `db_path` is the **resolved absolute path** to the database in use (default under `~/.wfb/wayfarer.db` when `--db` is omitted).
-- `highlights.*` arrays contain one object per row, with **keys matching SQL column names** (`id`, `title`, `status`, …, `metadata_json`, `updated_at`). Values are JSON types as returned from the DB (`metadata_json` remains a **string**).
-- Empty DB: counts zero, `highlights` empty arrays, `updated_at` values `null`.
+`db_path` is the resolved absolute database path. `highlights.*` rows use SQL column names; `metadata_json` remains a JSON string.
 
----
-
-## Exit codes
+## Exit Codes
 
 | Code | Meaning |
-|------|---------|
-| `0`  | Success. |
-| `2`  | CLI usage / argument error (e.g. missing `--json`/`--file` for `seed`). |
-| `3`  | Validation error (bad envelope, wrong `version`, invalid enum, malformed JSON). |
-| `4`  | Database error (connect, SQL, transaction). |
-| `5`  | File I/O error (unreadable `--file` path). |
+|---:|---|
+| `0` | Success. |
+| `2` | CLI usage / argument error. |
+| `3` | Validation error. |
+| `4` | Database error. |
+| `5` | File I/O, OAuth, token refresh, network, or Gemini API error. |
 
----
+## Implementation Notes
 
-## Implementation baseline (accepted for v1)
+- Python standard library only.
+- No external Python package requirements.
+- `wfb.py` is the CLI entrypoint.
+- Supporting modules:
+  - `wfb_paths.py`: local asset paths.
+  - `wfb_db.py`: SQLite schema and lifecycle.
+  - `wfb_oauth.py`: OAuth installed-app flow and token storage.
+  - `wfb_gemini_api.py`: Gemini REST client, model calls, summarization.
+  - `wfb_gemini_sessions.py`: local session storage and compaction helpers.
+  - `wfb_session_bridge.py`: manual browser-session attachment record helpers from earlier discovery work.
 
-- **Language:** Python 3, stdlib only: `argparse`, `sqlite3`, `json`, `pathlib` (optional), `sys`.
-- **Commands:** `wfb init`, `wfb seed`, `wfb status` only.
-- **Binary name:** `wfb` everywhere.
-- **Default asset layout:** **`~/.wfb/`** is the CLI asset directory; **`wayfarer.db`** defaults there (`wfb_home()` / `default_db_path()` in `wfb.py` keep this centralized for future paths).
-- **Contract:** This README is the single source of truth for v1 until v2 is documented.
+The security posture is intentionally conservative: local-first, stdlib-only, no shared OSS OAuth client secret, and no vendored third-party libraries yet. A deeper security review is still future work.
 
-The reference implementation **`wfb.py`** should behave as specified above.
+## Known Limits / Next Work
+
+- No packaged install flow yet.
+- No direct browser Gemini session attach through official API endpoints validated so far.
+- No retry/backoff policy for transient Gemini `429` / `503` errors yet.
+- No tool/function-calling support yet.
+- Summarization thresholds are heuristic and should be adjusted with real usage.

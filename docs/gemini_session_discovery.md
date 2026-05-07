@@ -1,10 +1,13 @@
-# Gemini API-Managed State Check
+# Gemini Session Discovery
 
-## Decision gate result
+This note records what `wfb` has validated about official Gemini API session support.
 
-- **API-managed reusable conversation/session handles: unsupported (current client surface).**
+## Decision Gate Result
 
-## Evidence
+- **API-managed reusable conversation/session handles:** unsupported in the REST surface currently used by `wfb`.
+- **Direct browser side-panel session attach:** unsupported by the endpoint probes validated so far.
+
+## API-Managed Conversation State
 
 Checked the REST endpoints already used by `wfb`:
 
@@ -15,35 +18,12 @@ Observed behavior:
 
 - Requests accept content turns and optional system instruction.
 - Responses return generated candidates/content.
-- No stable conversation/session id/handle is returned for reuse in later calls.
-- No documented companion endpoint in this surface exposes create/list/use session handles.
+- No stable conversation/session id or handle is returned for later reuse.
+- No companion endpoint in this validated surface exposes create/list/use chat handles.
 
-## Outcome for bridge design
+## Browser Session Attachment Probes
 
-`wfb` uses local session memory under `~/.wfb/`:
-
-- `gemini_sessions/<session_id>.json` stores turn history and metadata.
-- `gemini_active_session.json` stores active session pointer.
-
-This yields deterministic, agent-usable continuity while remaining stdlib-only.
-# Gemini Session Discovery Report
-
-## Scope
-
-Validate whether official Gemini REST APIs expose browser-session attachment primitives needed for the bridge:
-
-- `list_sessions`
-- `get_session_metadata`
-- `session_tab_context`
-- `attach_to_existing_browser_session`
-
-## Probing method
-
-- Authenticated with existing `wfb` OAuth token.
-- Probed likely REST paths under `https://generativelanguage.googleapis.com`.
-- Captured HTTP status and response detail.
-
-## Capability matrix
+Validated whether official Gemini REST APIs expose browser-session attachment primitives:
 
 | Capability | Endpoint Probe | Result |
 |---|---|---|
@@ -52,23 +32,27 @@ Validate whether official Gemini REST APIs expose browser-session attachment pri
 | `session_tab_context` | `/v1/sessions/probe:tabContext` | Unsupported (HTTP 404) |
 | `attach_to_existing_browser_session` | `/v1/sessions/probe:attach` | Unsupported (HTTP 404) |
 
-Additional probes (`/v1/chats`, `/v1beta/chats`, `/v1/conversations`, `/v1beta/conversations`) also returned HTTP 404 during discovery.
+Additional probes also returned HTTP 404 during discovery:
 
-## Decision gate outcome
+- `/v1/chats`
+- `/v1beta/chats`
+- `/v1/conversations`
+- `/v1beta/conversations`
 
-- **Direct official API attach is currently not supported** by the endpoints we can validate.
-- Bridge should proceed with a fallback design for browser-session mapping (extension bridge, browser automation, or explicit/manual mapping).
+## Current Fallback
 
-## Current bridge fallback implemented
+`wfb` uses local session memory under `~/.wfb/`:
 
-- `wfb gemini sessions list` prints discovery matrix.
-- `wfb gemini sessions attach --id ...` stores selected session reference locally at `~/.wfb/session_attachment.json`.
-- `wfb gemini sessions inspect` shows stored attachment reference.
+- `gemini_sessions/<session_id>.json` stores turn history and metadata.
+- `gemini_active_session.json` stores the active local session pointer.
 
-## Manual verification checklist
+Current commands:
 
-1. Run `wfb gemini sessions list` and confirm matrix output appears.
-2. Confirm unsupported capabilities currently report non-success status.
-3. Run `wfb gemini sessions attach --id my-session-id`.
-4. Run `wfb gemini sessions inspect` and confirm stored `session_id`.
-5. Confirm file exists at `~/.wfb/session_attachment.json`.
+- `wfb gemini session current`
+- `wfb gemini session list`
+- `wfb gemini session new [--name ...] [--model ...] [--system ...]`
+- `wfb gemini session use --id ...`
+- `wfb gemini session reset [--id ...]`
+- `wfb gemini session inspect [--id ...] [--format text|json]`
+
+This fallback gives terminal agents deterministic continuity while preserving the project constraint of no external Python dependencies.
