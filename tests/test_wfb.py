@@ -645,7 +645,10 @@ class TestWfb(unittest.TestCase):
                 "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
             }
         ]
-        with mock.patch("wfb.list_page_targets", return_value=targets):
+        with (
+            mock.patch("wfb.parse_target_types", return_value=("page",)),
+            mock.patch("wfb.list_targets", return_value=targets),
+        ):
             with mock.patch("sys.stdout") as out:
                 rc = wfb.main(["chrome", "targets", "--format", "json"])
             self.assertEqual(rc, 0)
@@ -665,7 +668,8 @@ class TestWfb(unittest.TestCase):
         ]
         with (
             mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
-            mock.patch("wfb.list_page_targets", return_value=targets),
+            mock.patch("wfb.parse_target_types", return_value=("page",)),
+            mock.patch("wfb.list_targets", return_value=targets),
             mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}) as save_attach,
         ):
             rc = wfb.main(["chrome", "attach", "--target-id", "t1"])
@@ -684,6 +688,7 @@ class TestWfb(unittest.TestCase):
         ]
         with (
             mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page",)),
             mock.patch(
                 "wfb.load_chrome_attachment",
                 return_value={
@@ -692,7 +697,7 @@ class TestWfb(unittest.TestCase):
                     "debug_port": 9222,
                 },
             ),
-            mock.patch("wfb.list_page_targets", return_value=targets),
+            mock.patch("wfb.list_targets", return_value=targets),
             mock.patch(
                 "wfb.inspect_target",
                 return_value={"title": "One", "url": "https://example.test/1", "text_snapshot": "abc"},
@@ -701,6 +706,31 @@ class TestWfb(unittest.TestCase):
             rc = wfb.main(["chrome", "inspect", "--format", "json"])
             self.assertEqual(rc, 0)
             inspect_target.assert_called_once()
+
+    def test_chrome_targets_gemini_only_passed(self):
+        with (
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb.list_targets", return_value=[] ) as list_targets,
+        ):
+            rc = wfb.main(["chrome", "targets", "--gemini-only", "--include-types", "page,webview"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(list_targets.call_args.kwargs["gemini_only"])
+
+    def test_chrome_attach_target_not_found_hints_webview(self):
+        with (
+            mock.patch("wfb.parse_target_types", return_value=("page",)),
+            mock.patch("wfb.list_targets", return_value=[]),
+        ):
+            rc = wfb.main(["chrome", "attach", "--target-id", "missing"])
+            self.assertEqual(rc, 5)
+
+    def test_chrome_targets_invalid_include_types_returns_exit_io(self):
+        with mock.patch(
+            "wfb.parse_target_types",
+            side_effect=wfb.ChromeBridgeError("unsupported target type"),
+        ):
+            rc = wfb.main(["chrome", "targets", "--include-types", "page,iframe"])
+            self.assertEqual(rc, 5)
 
     def test_chrome_launch_reports_already_running(self):
         payload = {"Browser": "Chrome/136", "already_running": True}

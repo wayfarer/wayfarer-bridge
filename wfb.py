@@ -19,7 +19,8 @@ from wfb_chrome_bridge import (
     choose_target,
     inspect_target,
     launch_chrome_debug,
-    list_page_targets,
+    list_targets,
+    parse_target_types,
 )
 from wfb_chrome_session import clear_attachment, load_attachment as load_chrome_attachment, save_attachment
 from wfb_db import UPDATED_AT_SQL, connect_db, init_db, require_v1_schema
@@ -842,6 +843,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"remote debugging port (default: {DEFAULT_DEBUG_PORT})",
     )
     c_targets.add_argument("--format", choices=("text", "json"), default="text")
+    c_targets.add_argument(
+        "--include-types",
+        default="page",
+        help="comma-separated target types to include (default: page)",
+    )
+    c_targets.add_argument(
+        "--gemini-only",
+        action="store_true",
+        help="show only Gemini side-panel related targets",
+    )
 
     c_attach = chrome_sub.add_parser("attach", help="persist selected Chrome target")
     c_attach.add_argument("--target-id", required=True, help="target id from chrome targets output")
@@ -852,6 +863,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"remote debugging port (default: {DEFAULT_DEBUG_PORT})",
     )
     c_attach.add_argument("--format", choices=("text", "json"), default="text")
+    c_attach.add_argument(
+        "--include-types",
+        default="page",
+        help="comma-separated target types to search (default: page)",
+    )
 
     c_inspect = chrome_sub.add_parser("inspect", help="inspect attached Chrome target content")
     c_inspect.add_argument("--target-id", help="override persisted target id for this call")
@@ -869,6 +885,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="max snapshot text chars (default: 4000)",
     )
     c_inspect.add_argument("--format", choices=("text", "json"), default="json")
+    c_inspect.add_argument(
+        "--include-types",
+        default="page",
+        help="comma-separated target types to search when resolving ids (default: page)",
+    )
 
     c_detach = chrome_sub.add_parser("detach", help="clear persisted Chrome target attachment")
     c_detach.add_argument("--format", choices=("text", "json"), default="text")
@@ -1207,7 +1228,12 @@ def main(argv: list[str] | None = None) -> int:
                 if args.port <= 0:
                     _err("--port must be positive")
                     return EXIT_USAGE
-                targets = list_page_targets(port=args.port)
+                selected_types = parse_target_types(args.include_types)
+                targets = list_targets(
+                    port=args.port,
+                    include_types=selected_types,
+                    gemini_only=bool(args.gemini_only),
+                )
                 if args.format == "json":
                     out = []
                     for t in targets:
@@ -1223,7 +1249,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(json.dumps(out, indent=2, sort_keys=True))
                 else:
                     if not targets:
-                        print("No page targets.")
+                        print("No matching targets.")
                     for t in targets:
                         print(
                             f"{t.get('id','')}\t{t.get('title','')}\t{t.get('url','')}\ttype={t.get('type','')}"
@@ -1234,8 +1260,13 @@ def main(argv: list[str] | None = None) -> int:
                 if args.port <= 0:
                     _err("--port must be positive")
                     return EXIT_USAGE
-                targets = list_page_targets(port=args.port)
-                target = choose_target(targets, args.target_id)
+                selected_types = parse_target_types(args.include_types)
+                targets = list_targets(port=args.port, include_types=selected_types)
+                try:
+                    target = choose_target(targets, args.target_id)
+                except ChromeBridgeError as e:
+                    _err(f"{e}; try --include-types page,webview")
+                    return EXIT_IO
                 ws_url = str(target.get("webSocketDebuggerUrl", ""))
                 if not ws_url:
                     _err(f"target missing websocket debugger url: {args.target_id}")
@@ -1266,11 +1297,16 @@ def main(argv: list[str] | None = None) -> int:
                 target_id = args.target_id
                 port = args.port
                 targets: list[dict[str, Any]] = []
+                selected_types = parse_target_types(args.include_types)
 
                 if target_id:
                     resolved_port = port if port is not None else DEFAULT_DEBUG_PORT
-                    targets = list_page_targets(port=resolved_port)
-                    target = choose_target(targets, target_id)
+                    targets = list_targets(port=resolved_port, include_types=selected_types)
+                    try:
+                        target = choose_target(targets, target_id)
+                    except ChromeBridgeError as e:
+                        _err(f"{e}; try --include-types page,webview")
+                        return EXIT_IO
                     ws_url = str(target.get("webSocketDebuggerUrl", ""))
                     port = resolved_port
                 else:
@@ -1286,8 +1322,12 @@ def main(argv: list[str] | None = None) -> int:
                             port = saved_port
                         else:
                             port = DEFAULT_DEBUG_PORT
-                    targets = list_page_targets(port=port)
-                    target = choose_target(targets, target_id)
+                    targets = list_targets(port=port, include_types=selected_types)
+                    try:
+                        target = choose_target(targets, target_id)
+                    except ChromeBridgeError as e:
+                        _err(f"{e}; try --include-types page,webview")
+                        return EXIT_IO
 
                 if not ws_url:
                     _err("target has no websocket debugger url")

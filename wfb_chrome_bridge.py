@@ -17,6 +17,8 @@ DEFAULT_DEBUG_HOST = "127.0.0.1"
 DEFAULT_DEBUG_PORT = 9222
 DEFAULT_TIMEOUT_SECONDS = 5.0
 MAX_TEXT_SNAPSHOT_CHARS = 4000
+DEFAULT_TARGET_TYPES = ("page",)
+SUPPORTED_TARGET_TYPES = frozenset({"page", "webview"})
 
 
 class ChromeBridgeError(Exception):
@@ -82,16 +84,50 @@ def fetch_targets(**kwargs: Any) -> list[dict[str, Any]]:
     return out
 
 
-def list_page_targets(**kwargs: Any) -> list[dict[str, Any]]:
+def parse_target_types(include_types: str | None) -> tuple[str, ...]:
+    if include_types is None or not include_types.strip():
+        return DEFAULT_TARGET_TYPES
+    types: list[str] = []
+    for raw in include_types.split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if item not in SUPPORTED_TARGET_TYPES:
+            supported = ", ".join(sorted(SUPPORTED_TARGET_TYPES))
+            raise ChromeBridgeError(f"unsupported target type: {item} (supported: {supported})")
+        if item not in types:
+            types.append(item)
+    if not types:
+        raise ChromeBridgeError("include-types resolved to empty set")
+    return tuple(types)
+
+
+def list_targets(
+    *,
+    include_types: tuple[str, ...] | None = None,
+    gemini_only: bool = False,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
     targets = fetch_targets(**kwargs)
-    pages: list[dict[str, Any]] = []
+    selected_types = include_types or DEFAULT_TARGET_TYPES
+    out: list[dict[str, Any]] = []
     for t in targets:
-        if str(t.get("type", "")) != "page":
+        ttype = str(t.get("type", "")).lower()
+        if ttype not in selected_types:
             continue
         if not t.get("webSocketDebuggerUrl"):
             continue
-        pages.append(t)
-    return pages
+        if gemini_only:
+            url = str(t.get("url", "")).lower()
+            title = str(t.get("title", "")).lower()
+            if "gemini.google.com/glic" not in url and "gemini" not in title:
+                continue
+        out.append(t)
+    return out
+
+
+def list_page_targets(**kwargs: Any) -> list[dict[str, Any]]:
+    return list_targets(include_types=("page",), gemini_only=False, **kwargs)
 
 
 def choose_target(targets: list[dict[str, Any]], target_id: str) -> dict[str, Any]:

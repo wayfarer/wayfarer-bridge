@@ -17,11 +17,13 @@ The official Gemini API surface does not currently expose a direct API to enumer
 
 ```sh
 wfb chrome launch --profile-mode isolated
-wfb chrome targets --format text
-wfb chrome attach --target-id <id>
-wfb chrome inspect --format json
+wfb chrome targets --include-types page,webview --format text
+wfb chrome attach --target-id <id> --include-types page,webview
+wfb chrome inspect --include-types page,webview --format json
 wfb chrome detach
 ```
+
+Defaults remain backward-compatible: without `--include-types`, `targets`/`attach`/`inspect` resolve page targets only.
 
 ## Data flow
 

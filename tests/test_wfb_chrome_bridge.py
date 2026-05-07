@@ -32,6 +32,32 @@ class _FakeSocket:
 
 
 class TestWfbChromeBridge(unittest.TestCase):
+    def test_parse_target_types_default(self):
+        self.assertEqual(bridge.parse_target_types(None), ("page",))
+
+    def test_parse_target_types_invalid_raises(self):
+        with self.assertRaises(bridge.ChromeBridgeError):
+            bridge.parse_target_types("page,iframe")
+
+    def test_list_targets_filters_types_and_gemini(self):
+        rows = [
+            {"id": "p1", "type": "page", "url": "https://example.test", "title": "Example", "webSocketDebuggerUrl": "ws://x"},
+            {
+                "id": "w1",
+                "type": "webview",
+                "url": "https://gemini.google.com/glic?hl=en",
+                "title": "Gemini Chrome :: New Conversation",
+                "webSocketDebuggerUrl": "ws://y",
+            },
+        ]
+        with mock.patch.object(bridge, "fetch_targets", return_value=rows):
+            gemini = bridge.list_targets(include_types=("webview",), gemini_only=True)
+            pages = bridge.list_targets(include_types=("page",), gemini_only=False)
+        self.assertEqual(len(gemini), 1)
+        self.assertEqual(gemini[0]["id"], "w1")
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["id"], "p1")
+
     def test_launch_short_circuits_when_endpoint_exists(self):
         with (
             mock.patch.object(bridge, "fetch_version", return_value={"Browser": "Chrome/1"}) as fetch_version,

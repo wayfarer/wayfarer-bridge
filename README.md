@@ -165,15 +165,22 @@ If a debug endpoint is already available on the port, `wfb` reuses it and skips 
 - `--profile-mode isolated` (default): uses `~/.wfb/chrome_debug_profile/`.
 - `--profile-mode user`: uses your normal Chrome profile (higher fidelity, higher risk).
 
-### `wfb chrome targets [--port N] [--format text|json]`
+### `wfb chrome targets [--port N] [--include-types page,webview] [--gemini-only] [--format text|json]`
 
-Lists attachable `type=page` CDP targets from `/json/list`.
+Lists attachable CDP targets from `/json/list`.
 
-### `wfb chrome attach --target-id ID [--port N] [--format text|json]`
+- Default target types: `page` (backward-compatible behavior).
+- `--include-types page,webview` includes Gemini side-panel webviews.
+- `--gemini-only` narrows output to Gemini-related targets.
+
+### `wfb chrome attach --target-id ID [--port N] [--include-types page,webview] [--format text|json]`
 
 Stores the selected target in `~/.wfb/chrome_attachment.json` for later inspection.
 
-### `wfb chrome inspect [--target-id ID] [--port N] [--max-chars N] [--format text|json]`
+- Default target types searched: `page`.
+- Use `--include-types page,webview` when attaching Gemini side-panel IDs.
+
+### `wfb chrome inspect [--target-id ID] [--port N] [--include-types page,webview] [--max-chars N] [--format text|json]`
 
 Reads bounded tab context from CDP `Runtime.evaluate` and prints JSON by default:
 
@@ -455,6 +462,7 @@ The security posture is intentionally conservative: local-first, stdlib-only, no
 - No retry/backoff policy for transient Gemini `429` / `503` errors yet.
 - No tool/function-calling support yet.
 - Summarization thresholds are heuristic and should be adjusted with real usage.
+- Planned next CLI ergonomics after webview support include wrapper capture flow and trust-profile work.
 
 ## Packaging and Release (PyPI-style)
 
