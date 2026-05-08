@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wfb"
-version = "0.1.1"
+version = "0.1.2"
 description = "Stdlib-only local CLI bridge for Gemini chat memory and world-state context"
 readme = "README.md"
 requires-python = ">=3.9"
