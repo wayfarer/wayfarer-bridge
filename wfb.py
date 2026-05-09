@@ -507,6 +507,47 @@ def _chrome_recovery_hint(port: int) -> str:
     )
 
 
+def _chrome_diagnostics_hint() -> str:
+    return (
+        "Diagnostics: run `wfb bridge doctor --format json` for endpoint, ports, "
+        "targets, and attachment."
+    )
+
+
+def _chrome_failure_message(
+    head: str,
+    *,
+    requested_port: int,
+    resolved_port: int | None = None,
+) -> str:
+    lines = [head.rstrip()]
+    if resolved_port is not None and int(resolved_port) != int(requested_port):
+        lines.append(
+            f"Note: last debug port used {resolved_port} (requested {requested_port}); "
+            "`wfb chrome targets` / `wfb chrome attach` use `--port` only (no auto-fallback)."
+        )
+    lines.append(_chrome_diagnostics_hint())
+    return "\n".join(lines)
+
+
+def _chrome_requested_port_cli(args: Any) -> int:
+    p = getattr(args, "port", None)
+    if isinstance(p, int) and p > 0:
+        return int(p)
+    return DEFAULT_DEBUG_PORT
+
+
+def _maybe_warn_empty_snapshot(text: str, *, context: str) -> None:
+    snap = str(text or "")
+    if len(snap) != 0:
+        return
+    print(
+        f"wfb: empty text snapshot in {context}; pick a different tab or pass `--target-id` from "
+        "`wfb chrome targets` (internal chrome:// pages often have no readable text).",
+        file=sys.stderr,
+    )
+
+
 def _chrome_current_payload(home: Path, fallback_port: int = DEFAULT_DEBUG_PORT) -> dict[str, Any]:
     attachment = load_chrome_attachment(home)
     payload: dict[str, Any] = {
@@ -1725,7 +1766,12 @@ def main(argv: list[str] | None = None) -> int:
                         gemini_only=bool(args.gemini_only),
                     )
                 except ChromeBridgeError as e:
-                    _err(f"{e}; {_chrome_recovery_hint(args.port)}")
+                    _err(
+                        _chrome_failure_message(
+                            f"{e}; {_chrome_recovery_hint(args.port)}",
+                            requested_port=int(args.port),
+                        )
+                    )
                     return EXIT_IO
                 if args.format == "json":
                     out = []
@@ -1757,16 +1803,31 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     targets = list_targets(port=args.port, include_types=selected_types)
                 except ChromeBridgeError as e:
-                    _err(f"{e}; {_chrome_recovery_hint(args.port)}")
+                    _err(
+                        _chrome_failure_message(
+                            f"{e}; {_chrome_recovery_hint(args.port)}",
+                            requested_port=int(args.port),
+                        )
+                    )
                     return EXIT_IO
                 try:
                     target = choose_target(targets, args.target_id)
                 except ChromeBridgeError as e:
-                    _err(f"{e}; try --include-types page,webview; {_chrome_recovery_hint(args.port)}")
+                    _err(
+                        _chrome_failure_message(
+                            f"{e}; try --include-types page,webview; {_chrome_recovery_hint(args.port)}",
+                            requested_port=int(args.port),
+                        )
+                    )
                     return EXIT_IO
                 ws_url = str(target.get("webSocketDebuggerUrl", ""))
                 if not ws_url:
-                    _err(f"target missing websocket debugger url: {args.target_id}")
+                    _err(
+                        _chrome_failure_message(
+                            f"target missing websocket debugger url: {args.target_id}",
+                            requested_port=int(args.port),
+                        )
+                    )
                     return EXIT_IO
                 payload = save_attachment(
                     wfb_home(),
@@ -1809,8 +1870,11 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     except ChromeBridgeError as e:
                         _err(
-                            f"{e}; try --include-types page,webview; "
-                            f"{_chrome_recovery_hint(inspect_requested_port)}"
+                            _chrome_failure_message(
+                                f"{e}; try --include-types page,webview; "
+                                f"{_chrome_recovery_hint(inspect_requested_port)}",
+                                requested_port=int(inspect_requested_port),
+                            )
                         )
                         return EXIT_IO
                     ws_url = str(target.get("webSocketDebuggerUrl", ""))
@@ -1818,7 +1882,10 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     attachment = load_chrome_attachment(wfb_home())
                     if attachment is None:
-                        _err("no attached Chrome target; run `wfb chrome attach --target-id ...`")
+                        _err(
+                            "no attached Chrome target; run `wfb chrome attach --target-id ...`\n"
+                            + _chrome_diagnostics_hint()
+                        )
                         return EXIT_IO
                     ws_url = str(attachment.get("webSocketDebuggerUrl", ""))
                     inspect_target_key = str(attachment.get("target_id", ""))
@@ -1841,27 +1908,47 @@ def main(argv: list[str] | None = None) -> int:
                             gemini_only=False,
                         )
                     except ChromeBridgeError as e:
-                        _err(f"{e}; {_chrome_recovery_hint(inspect_requested_port)}")
+                        _err(
+                            _chrome_failure_message(
+                                f"{e}; {_chrome_recovery_hint(inspect_requested_port)}",
+                                requested_port=int(inspect_requested_port),
+                            )
+                        )
                         return EXIT_IO
                     try:
                         target = choose_target(targets, inspect_target_key)
                     except ChromeBridgeError as e:
                         _err(
-                            f"{e}; try --include-types page,webview; "
-                            f"{_chrome_recovery_hint(resolved_port_used)}"
+                            _chrome_failure_message(
+                                f"{e}; try --include-types page,webview; "
+                                f"{_chrome_recovery_hint(resolved_port_used)}",
+                                requested_port=int(inspect_requested_port),
+                                resolved_port=int(resolved_port_used),
+                            )
                         )
                         return EXIT_IO
                     ws_url = str(target.get("webSocketDebuggerUrl", ""))
                     port = resolved_port_used
 
                 if not ws_url:
-                    _err("target has no websocket debugger url")
+                    rp = int(port) if port is not None else None
+                    _err(
+                        _chrome_failure_message(
+                            "target has no websocket debugger url",
+                            requested_port=int(inspect_requested_port),
+                            resolved_port=rp,
+                        )
+                    )
                     return EXIT_IO
 
                 context = inspect_target(
                     ws_url=ws_url,
                     timeout_seconds=args.timeout_seconds,
                     max_chars=args.max_chars,
+                )
+                _maybe_warn_empty_snapshot(
+                    str(context.get("text_snapshot", "")),
+                    context="chrome inspect",
                 )
                 if target is not None:
                     context["target"] = {
@@ -1930,7 +2017,12 @@ def main(argv: list[str] | None = None) -> int:
                         gemini_only=bool(args.gemini_only),
                     )
                 except ChromeBridgeError as e:
-                    _err(f"{e}; {_chrome_recovery_hint(args.port)}")
+                    _err(
+                        _chrome_failure_message(
+                            f"{e}; {_chrome_recovery_hint(args.port)}",
+                            requested_port=int(args.port),
+                        )
+                    )
                     return EXIT_IO
                 try:
                     target, selection_method, selection_reason = select_capture_target(
@@ -1938,11 +2030,23 @@ def main(argv: list[str] | None = None) -> int:
                         target_id=args.target_id,
                     )
                 except ChromeBridgeError as e:
-                    _err(f"{e}; {_chrome_recovery_hint(resolved_port)}")
+                    _err(
+                        _chrome_failure_message(
+                            f"{e}; {_chrome_recovery_hint(resolved_port)}",
+                            requested_port=int(args.port),
+                            resolved_port=int(resolved_port),
+                        )
+                    )
                     return EXIT_IO
                 ws_url = str(target.get("webSocketDebuggerUrl", ""))
                 if not ws_url:
-                    _err("selected target missing websocket debugger url")
+                    _err(
+                        _chrome_failure_message(
+                            "selected target missing websocket debugger url",
+                            requested_port=int(args.port),
+                            resolved_port=int(resolved_port),
+                        )
+                    )
                     return EXIT_IO
                 attachment = save_attachment(
                     wfb_home(),
@@ -1956,6 +2060,10 @@ def main(argv: list[str] | None = None) -> int:
                 inspect_payload = inspect_target(
                     ws_url=ws_url,
                     max_chars=args.max_chars,
+                )
+                _maybe_warn_empty_snapshot(
+                    str(inspect_payload.get("text_snapshot", "")),
+                    context="chrome capture",
                 )
                 inspect_payload["target"] = {
                     "id": str(target.get("id", "")),
@@ -1982,7 +2090,19 @@ def main(argv: list[str] | None = None) -> int:
                     print(payload["inspect"].get("text_snapshot", ""))
                 return EXIT_OK
         except ChromeBridgeError as e:
-            _err(str(e))
+            rp = locals().get("resolved_port")
+            if not isinstance(rp, int):
+                p2 = locals().get("port")
+                if isinstance(p2, int):
+                    rp = p2
+            res = int(rp) if isinstance(rp, int) else None
+            _err(
+                _chrome_failure_message(
+                    str(e),
+                    requested_port=_chrome_requested_port_cli(args),
+                    resolved_port=res,
+                )
+            )
             return EXIT_IO
 
     if args.command == "bridge":
@@ -2036,7 +2156,12 @@ def main(argv: list[str] | None = None) -> int:
                         gemini_only=bool(args.gemini_only),
                     )
                 except ChromeBridgeError as e:
-                    _err(f"capture stage failed: {e}; {_chrome_recovery_hint(args.port)}")
+                    _err(
+                        _chrome_failure_message(
+                            f"capture stage failed: {e}; {_chrome_recovery_hint(args.port)}",
+                            requested_port=int(args.port),
+                        )
+                    )
                     return EXIT_IO
                 try:
                     target, selection_method, selection_reason = select_capture_target(
@@ -2044,11 +2169,23 @@ def main(argv: list[str] | None = None) -> int:
                         target_id=args.target_id,
                     )
                 except ChromeBridgeError as e:
-                    _err(f"capture stage failed: {e}; {_chrome_recovery_hint(resolved_port)}")
+                    _err(
+                        _chrome_failure_message(
+                            f"capture stage failed: {e}; {_chrome_recovery_hint(resolved_port)}",
+                            requested_port=int(args.port),
+                            resolved_port=int(resolved_port),
+                        )
+                    )
                     return EXIT_IO
                 ws_url = str(target.get("webSocketDebuggerUrl", ""))
                 if not ws_url:
-                    _err("capture stage failed: selected target missing websocket debugger url")
+                    _err(
+                        _chrome_failure_message(
+                            "capture stage failed: selected target missing websocket debugger url",
+                            requested_port=int(args.port),
+                            resolved_port=int(resolved_port),
+                        )
+                    )
                     return EXIT_IO
                 save_attachment(
                     wfb_home(),
@@ -2063,8 +2200,9 @@ def main(argv: list[str] | None = None) -> int:
                     ws_url=ws_url,
                     max_chars=args.max_chars,
                 )
-
                 text_snapshot = str(inspect_result.get("text_snapshot", ""))
+                _maybe_warn_empty_snapshot(text_snapshot, context="bridge ask")
+
                 page_title = str(inspect_result.get("title", target.get("title", "")))
                 page_url = str(inspect_result.get("url", target.get("url", "")))
                 snapshot_chars = int(inspect_result.get("text_snapshot_chars", len(text_snapshot)))
@@ -2196,7 +2334,10 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     except ChromeBridgeError as e:
                         step["status"] = "error"
-                        step["error"] = f"capture stage failed: {e}"
+                        step["error"] = _chrome_failure_message(
+                            f"capture stage failed: {e}; {_chrome_recovery_hint(args.port)}",
+                            requested_port=int(args.port),
+                        )
                         iterations.append(step)
                         stop_reason = "error"
                         break
@@ -2207,14 +2348,22 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     except ChromeBridgeError as e:
                         step["status"] = "error"
-                        step["error"] = f"capture stage failed: {e}"
+                        step["error"] = _chrome_failure_message(
+                            f"capture stage failed: {e}; {_chrome_recovery_hint(resolved_port)}",
+                            requested_port=int(args.port),
+                            resolved_port=int(resolved_port),
+                        )
                         iterations.append(step)
                         stop_reason = "error"
                         break
                     ws_url = str(target.get("webSocketDebuggerUrl", ""))
                     if not ws_url:
                         step["status"] = "error"
-                        step["error"] = "selected target missing websocket debugger url"
+                        step["error"] = _chrome_failure_message(
+                            "capture stage failed: selected target missing websocket debugger url",
+                            requested_port=int(args.port),
+                            resolved_port=int(resolved_port),
+                        )
                         iterations.append(step)
                         stop_reason = "error"
                         break
@@ -2236,12 +2385,17 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     except ChromeBridgeError as e:
                         step["status"] = "error"
-                        step["error"] = f"inspect stage failed: {e}"
+                        step["error"] = _chrome_failure_message(
+                            f"inspect stage failed: {e}",
+                            requested_port=int(args.port),
+                            resolved_port=int(resolved_port),
+                        )
                         iterations.append(step)
                         stop_reason = "error"
                         break
 
                     text_snapshot = str(inspect_result.get("text_snapshot", ""))
+                    _maybe_warn_empty_snapshot(text_snapshot, context="bridge loop")
                     page_title = str(inspect_result.get("title", target.get("title", "")))
                     page_url = str(inspect_result.get("url", target.get("url", "")))
                     snapshot_chars = int(inspect_result.get("text_snapshot_chars", len(text_snapshot)))
@@ -2353,7 +2507,22 @@ def main(argv: list[str] | None = None) -> int:
                         print(last_answer)
                 return EXIT_OK
         except (ChromeBridgeError, GeminiApiError, OAuthFlowError) as e:
-            _err(str(e))
+            if isinstance(e, ChromeBridgeError):
+                rp = locals().get("resolved_port")
+                if not isinstance(rp, int):
+                    p2 = locals().get("port")
+                    if isinstance(p2, int):
+                        rp = p2
+                res = int(rp) if isinstance(rp, int) else None
+                _err(
+                    _chrome_failure_message(
+                        str(e),
+                        requested_port=_chrome_requested_port_cli(args),
+                        resolved_port=res,
+                    )
+                )
+            else:
+                _err(str(e))
             return EXIT_IO
 
     try:

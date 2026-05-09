@@ -937,6 +937,40 @@ class TestWfb(unittest.TestCase):
             self.assertEqual(rc, 5)
             written = "".join(call.args[0] for call in err.write.call_args_list if call.args)
             self.assertIn("next steps:", written)
+            self.assertIn("wfb bridge doctor", written)
+
+    def test_chrome_capture_warns_on_empty_text_snapshot(self):
+        target = {
+            "id": "t1",
+            "title": "Internal",
+            "url": "chrome://version/",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        empty_inspect = {
+            "title": "Internal",
+            "url": "chrome://version/",
+            "text_snapshot": "",
+            "text_snapshot_chars": 0,
+            "text_snapshot_truncated": False,
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch(
+                "wfb.select_capture_target",
+                return_value=(target, "heuristic", "selected by heuristic ranking"),
+            ),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=empty_inspect),
+            mock.patch("sys.stdout"),
+            mock.patch("sys.stderr") as err,
+        ):
+            rc = wfb.main(["chrome", "capture", "--format", "json"])
+        self.assertEqual(rc, 0)
+        written = "".join(call.args[0] for call in err.write.call_args_list if call.args)
+        self.assertIn("empty text snapshot", written)
 
     def test_chrome_launch_reports_already_running(self):
         payload = {
@@ -1149,6 +1183,7 @@ class TestWfb(unittest.TestCase):
             written = "".join(call.args[0] for call in err.write.call_args_list if call.args)
             self.assertIn("capture stage failed", written)
             self.assertIn("next steps:", written)
+            self.assertIn("wfb bridge doctor", written)
 
     def test_bridge_ask_gemini_failure_reports_stage(self):
         target = {
@@ -1358,6 +1393,7 @@ class TestWfb(unittest.TestCase):
             self.assertEqual(payload["run"]["stop_reason"], "error")
             self.assertEqual(payload["iterations"][0]["status"], "error")
             self.assertIn("capture stage failed", payload["iterations"][0]["error"])
+            self.assertIn("wfb bridge doctor", payload["iterations"][0]["error"])
 
     def test_bridge_loop_ask_error_stops_with_error_reason(self):
         target = {
