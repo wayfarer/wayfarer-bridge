@@ -9,6 +9,14 @@ The project currently has two working context channels:
 
 Direct attachment to active browser Gemini side-panel sessions is not available through the validated official Gemini API surface today. For now, `wfb` uses local session memory as the bridgeable, agent-friendly fallback.
 
+## For terminal agents (Chrome CDP)
+
+- **Debug instance only:** `wfb` only sees tabs on the Chrome process that exposes the remote-debug HTTP endpoint for the port and profile you use. A normal daily browser window without remote debugging does not appear in `wfb chrome targets`.
+- **Blind or recovery start:** Run `wfb bridge doctor --format json` for endpoint reachability, requested vs resolved port, attachment state, and suggested next commands.
+- **Port probing:** `wfb chrome capture`, `wfb chrome inspect`, and `wfb bridge …` try the requested port first, then other detected debug ports. **`wfb chrome targets` and `wfb chrome attach` use `--port` only** (no automatic fallback). Use the port from doctor or pass `--port` explicitly when listing or attaching.
+- **Metadata vs snapshot:** `chrome targets` and doctor list ids, titles, URLs, and types. **`capture`**, **`inspect`**, and **`bridge`** read bounded page text. Sensitive URLs still show up in listings.
+- **Internal Chrome URLs:** `chrome://…` pages often produce empty or unhelpful snapshots compared with normal `https://` tabs. When several targets exist (for example Google AI internal UI vs the search results page), prefer **`--target-id`** from `chrome targets`.
+
 ## What Works Today
 
 - `wfb init` creates the local asset directory, initializes the SQLite DB, and runs OAuth login.

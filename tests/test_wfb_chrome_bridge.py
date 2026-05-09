@@ -86,6 +86,34 @@ class TestWfbChromeBridge(unittest.TestCase):
         self.assertEqual(chosen["id"], "a")
         self.assertEqual(method, "explicit_id")
 
+    def test_select_capture_target_deprioritizes_chrome_internal_urls(self):
+        targets = [
+            {
+                "id": "internal",
+                "title": "Internal UI",
+                "url": "chrome://contextual-tasks/?q=test",
+                "type": "page",
+            },
+            {
+                "id": "serp",
+                "title": "Search",
+                "url": "https://www.google.com/search?q=test",
+                "type": "page",
+            },
+        ]
+        chosen, method, _ = bridge.select_capture_target(targets)
+        self.assertEqual(chosen["id"], "serp")
+        self.assertEqual(method, "heuristic")
+
+    def test_select_capture_target_only_chrome_internal_still_selects(self):
+        targets = [
+            {"id": "a", "title": "A", "url": "chrome://contextual-tasks/?q=1", "type": "page"},
+            {"id": "b", "title": "B", "url": "chrome://version/", "type": "page"},
+        ]
+        chosen, method, _ = bridge.select_capture_target(targets)
+        self.assertEqual(method, "heuristic")
+        self.assertEqual(chosen["id"], "a")
+
     def test_launch_short_circuits_when_endpoint_exists(self):
         with (
             mock.patch.object(bridge, "fetch_version", return_value={"Browser": "Chrome/1"}) as fetch_version,

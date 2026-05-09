@@ -73,7 +73,7 @@ BRIDGE_PROMPT_TEMPLATE_VERSION = "1"
 AGENT_WORKFLOW_GUIDANCE = """Agent workflow guidance:
   1) Initialize once: `wfb init`
   2) Diagnostics (blind start):
-       - `wfb bridge doctor --format json`
+       - `wfb bridge doctor --format json` (shows resolved debug port; `chrome targets`/`attach` need matching `--port`, no auto-fallback)
   3) One-shot browser-to-Gemini bridge:
        - `wfb bridge ask --prompt "summarize this page" --format json`
        (runs capture -> prompt envelope -> gemini ask in a single call)

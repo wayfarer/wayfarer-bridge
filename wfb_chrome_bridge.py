@@ -172,7 +172,11 @@ def select_capture_target(
         score = 0
         url = str(t.get("url", "")).lower()
         title = str(t.get("title", "")).lower()
-        if not url.startswith("chrome://omnibox-popup"):
+        if url.startswith("chrome://omnibox-popup"):
+            pass
+        elif url.startswith("chrome://"):
+            score += 1
+        else:
             score += 4
         if "gemini.google.com/glic" in url or "gemini" in title:
             score += 3
