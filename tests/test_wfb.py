@@ -847,6 +847,619 @@ class TestWfb(unittest.TestCase):
             "ws://127.0.0.1:9333/devtools/page/t1",
         )
 
+    @staticmethod
+    def _ax_node(node_id, role, name=None, child_ids=None, ignored=False, parent_id=None):
+        node = {
+            "nodeId": node_id,
+            "ignored": ignored,
+            "role": {"type": "internalRole", "value": role},
+            "childIds": child_ids or [],
+        }
+        if name is not None:
+            node["name"] = {"type": "computedString", "value": name}
+        if parent_id is not None:
+            node["parentId"] = parent_id
+        return node
+
+    @staticmethod
+    def _ax_attachment_target():
+        return {
+            "id": "t1",
+            "title": "Conversation",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+
+    def test_chrome_ax_outline_renders_indented_tree(self):
+        target = self._ax_attachment_target()
+        ax_nodes = [
+            self._ax_node("1", "WebArea", child_ids=["2"]),
+            self._ax_node("2", "main", name="Conversation", child_ids=["3"], parent_id="1"),
+            self._ax_node("3", "button", name="Send", parent_id="2"),
+        ]
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "webSocketDebuggerUrl": target["webSocketDebuggerUrl"],
+                    "debug_port": 9222,
+                },
+            ),
+            mock.patch("wfb.list_targets", return_value=[target]),
+            mock.patch("wfb.get_accessibility_tree", return_value=ax_nodes) as get_ax,
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["chrome", "ax", "--format", "outline"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            self.assertIn("WebArea", written)
+            self.assertIn('main "Conversation"', written)
+            self.assertIn('button "Send"', written)
+            self.assertIn("# total_nodes=3", written)
+            get_ax.assert_called_once()
+
+    def test_chrome_ax_json_includes_filters_quality_and_nodes(self):
+        target = self._ax_attachment_target()
+        ax_nodes = [
+            self._ax_node("1", "main", child_ids=["2"]),
+            self._ax_node("2", "textbox", name="Compose", parent_id="1"),
+            self._ax_node("3", "generic"),
+        ]
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "webSocketDebuggerUrl": target["webSocketDebuggerUrl"],
+                    "debug_port": 9222,
+                },
+            ),
+            mock.patch("wfb.list_targets", return_value=[target]),
+            mock.patch("wfb.get_accessibility_tree", return_value=ax_nodes),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(
+                    ["chrome", "ax", "--format", "json", "--role", "textbox"]
+                )
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["target"]["id"], "t1")
+            self.assertEqual(payload["filters"]["role"], "textbox")
+            self.assertEqual(payload["outline_meta"]["selected_count"], 1)
+            self.assertGreaterEqual(payload["ax_quality"]["meaningful_roles"], 1)
+            self.assertEqual([n["role"] for n in payload["nodes"]], ["textbox"])
+
+    def test_chrome_ax_propagates_depth_to_cdp(self):
+        target = self._ax_attachment_target()
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "webSocketDebuggerUrl": target["webSocketDebuggerUrl"],
+                    "debug_port": 9222,
+                },
+            ),
+            mock.patch("wfb.list_targets", return_value=[target]),
+            mock.patch("wfb.get_accessibility_tree", return_value=[]) as get_ax,
+        ):
+            rc = wfb.main(["chrome", "ax", "--format", "json", "--depth", "3"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(get_ax.call_args.kwargs["depth"], 3)
+
+    def test_chrome_ax_validates_args(self):
+        with mock.patch("sys.stderr"):
+            rc = wfb.main(["chrome", "ax", "--max-nodes", "0"])
+            self.assertEqual(rc, 2)
+            rc = wfb.main(["chrome", "ax", "--depth", "-1"])
+            self.assertEqual(rc, 2)
+
+    def test_chrome_ax_no_attachment_returns_io_error(self):
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb.load_chrome_attachment", return_value=None),
+            mock.patch("sys.stderr") as err,
+        ):
+            rc = wfb.main(["chrome", "ax"])
+            self.assertEqual(rc, 5)
+            written = "".join(call.args[0] for call in err.write.call_args_list if call.args)
+            self.assertIn("no attached Chrome target", written)
+
+    def test_chrome_find_returns_text_and_aom_matches(self):
+        target = self._ax_attachment_target()
+        ax_nodes = [
+            self._ax_node("1", "main", name="Conversation", child_ids=["2"]),
+            self._ax_node("2", "log", name="Find this needle here", parent_id="1"),
+        ]
+        inspect_payload = {
+            "title": "Conversation",
+            "url": "https://example.test",
+            "text_snapshot": "before needle here and another needle there",
+            "text_snapshot_chars": 43,
+            "text_snapshot_truncated": False,
+            "selector_matched": None,
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "webSocketDebuggerUrl": target["webSocketDebuggerUrl"],
+                    "debug_port": 9222,
+                },
+            ),
+            mock.patch("wfb.list_targets", return_value=[target]),
+            mock.patch("wfb.inspect_target", return_value=inspect_payload),
+            mock.patch("wfb.get_accessibility_tree", return_value=ax_nodes),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(
+                    ["chrome", "find", "--query", "needle", "--format", "json"]
+                )
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["query"], "needle")
+            self.assertEqual(payload["mode"], "both")
+            self.assertEqual(len(payload["text_matches"]), 2)
+            self.assertEqual(len(payload["ax_matches"]), 1)
+            self.assertEqual(payload["ax_matches"][0]["role"], "log")
+            self.assertEqual(
+                [p["role"] for p in payload["ax_matches"][0]["path"]],
+                ["main", "log"],
+            )
+
+    def test_chrome_find_text_only_skips_aom(self):
+        target = self._ax_attachment_target()
+        inspect_payload = {
+            "title": "T",
+            "url": "https://example.test",
+            "text_snapshot": "needle text",
+            "text_snapshot_chars": 11,
+            "text_snapshot_truncated": False,
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "webSocketDebuggerUrl": target["webSocketDebuggerUrl"],
+                    "debug_port": 9222,
+                },
+            ),
+            mock.patch("wfb.list_targets", return_value=[target]),
+            mock.patch("wfb.inspect_target", return_value=inspect_payload),
+            mock.patch("wfb.get_accessibility_tree") as get_ax,
+        ):
+            rc = wfb.main(
+                [
+                    "chrome",
+                    "find",
+                    "--query",
+                    "needle",
+                    "--mode",
+                    "text",
+                    "--format",
+                    "json",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            get_ax.assert_not_called()
+
+    def test_chrome_find_aom_only_skips_text(self):
+        target = self._ax_attachment_target()
+        ax_nodes = [self._ax_node("1", "log", name="needle here")]
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "webSocketDebuggerUrl": target["webSocketDebuggerUrl"],
+                    "debug_port": 9222,
+                },
+            ),
+            mock.patch("wfb.list_targets", return_value=[target]),
+            mock.patch("wfb.inspect_target") as inspect_mock,
+            mock.patch("wfb.get_accessibility_tree", return_value=ax_nodes),
+        ):
+            rc = wfb.main(
+                [
+                    "chrome",
+                    "find",
+                    "--query",
+                    "needle",
+                    "--mode",
+                    "aom",
+                    "--format",
+                    "json",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            inspect_mock.assert_not_called()
+
+    def test_chrome_find_validates_args(self):
+        with mock.patch("sys.stderr"):
+            rc = wfb.main(["chrome", "find", "--query", "x", "--max-results", "0"])
+            self.assertEqual(rc, 2)
+            rc = wfb.main(["chrome", "find", "--query", " "])
+            self.assertEqual(rc, 2)
+
+    def test_chrome_inspect_passes_selector_to_inspect_target(self):
+        target = self._ax_attachment_target()
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page",)),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "webSocketDebuggerUrl": target["webSocketDebuggerUrl"],
+                    "debug_port": 9222,
+                },
+            ),
+            mock.patch("wfb.list_targets", return_value=[target]),
+            mock.patch(
+                "wfb.inspect_target",
+                return_value={
+                    "title": "T",
+                    "url": "https://example.test",
+                    "text_snapshot": "subtree",
+                    "text_snapshot_chars": 7,
+                    "text_snapshot_truncated": False,
+                    "selector": "main",
+                    "selector_matched": True,
+                },
+            ) as inspect_mock,
+        ):
+            rc = wfb.main(
+                ["chrome", "inspect", "--format", "json", "--selector", "main"]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(inspect_mock.call_args.kwargs["selector"], "main")
+
+    def test_chrome_inspect_warns_when_selector_unmatched(self):
+        target = self._ax_attachment_target()
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page",)),
+            mock.patch("wfb.detect_debug_ports", return_value=[]),
+            mock.patch(
+                "wfb.load_chrome_attachment",
+                return_value={
+                    "target_id": "t1",
+                    "webSocketDebuggerUrl": target["webSocketDebuggerUrl"],
+                    "debug_port": 9222,
+                },
+            ),
+            mock.patch("wfb.list_targets", return_value=[target]),
+            mock.patch(
+                "wfb.inspect_target",
+                return_value={
+                    "title": "T",
+                    "url": "https://example.test",
+                    "text_snapshot": "",
+                    "text_snapshot_chars": 0,
+                    "text_snapshot_truncated": False,
+                    "selector": ".missing",
+                    "selector_matched": False,
+                },
+            ),
+            mock.patch("sys.stderr") as err,
+        ):
+            rc = wfb.main(
+                ["chrome", "inspect", "--format", "json", "--selector", ".missing"]
+            )
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in err.write.call_args_list if call.args)
+            self.assertIn("selector did not match", written)
+
+    def test_bridge_ask_auto_capture_picks_aom_with_meaningful_roles(self):
+        target = {
+            "id": "t1",
+            "title": "Page",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        ax_nodes = [
+            self._ax_node("1", "main", name="Page", child_ids=["2", "3", "4", "5", "6"]),
+            self._ax_node("2", "heading", name="Welcome", parent_id="1"),
+            self._ax_node("3", "paragraph", name="Body text", parent_id="1"),
+            self._ax_node("4", "button", name="Send", parent_id="1"),
+            self._ax_node("5", "textbox", name="Compose", parent_id="1"),
+            self._ax_node("6", "link", name="Home", parent_id="1"),
+        ]
+        inspect_payload = {
+            "title": "Page",
+            "url": "https://example.test",
+            "text_snapshot": "fallback text",
+            "text_snapshot_chars": 13,
+            "text_snapshot_truncated": False,
+        }
+        fake_session = {
+            "id": "sess_auto",
+            "name": "sess_auto",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=inspect_payload),
+            mock.patch("wfb.get_accessibility_tree", return_value=ax_nodes),
+            mock.patch("wfb.get_active_session_id", return_value="sess_auto"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok") as ask_mock,
+            mock.patch("wfb.append_turn"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["bridge", "ask", "--prompt", "summarize"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["capture"]["mode_chosen"], "aom")
+            self.assertIn("auto:", payload["capture"]["mode_reason"])
+            self.assertEqual(
+                payload["prompt_envelope"]["budget"]["capture_mode"],
+                "aom",
+            )
+            self.assertGreater(
+                payload["prompt_envelope"]["budget"]["ax_total_nodes"],
+                0,
+            )
+            sent_message = ask_mock.call_args.kwargs["messages"][0]["text"]
+            self.assertIn("--- ACCESSIBILITY OUTLINE ---", sent_message)
+            self.assertNotIn("--- PAGE CONTENT ---", sent_message)
+
+    def test_bridge_ask_capture_mode_text_keeps_legacy_envelope(self):
+        target = {
+            "id": "t1",
+            "title": "Page",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        inspect_payload = {
+            "title": "Page",
+            "url": "https://example.test",
+            "text_snapshot": "body text",
+            "text_snapshot_chars": 9,
+            "text_snapshot_truncated": False,
+        }
+        fake_session = {
+            "id": "sess_text",
+            "name": "sess_text",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=inspect_payload),
+            mock.patch("wfb.get_accessibility_tree") as get_ax,
+            mock.patch("wfb.get_active_session_id", return_value="sess_text"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok") as ask_mock,
+            mock.patch("wfb.append_turn"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(
+                    [
+                        "bridge",
+                        "ask",
+                        "--prompt",
+                        "summarize",
+                        "--capture-mode",
+                        "text",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            get_ax.assert_not_called()
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["capture"]["mode_chosen"], "text")
+            sent_message = ask_mock.call_args.kwargs["messages"][0]["text"]
+            self.assertIn("--- PAGE CONTENT ---", sent_message)
+            self.assertNotIn("--- ACCESSIBILITY OUTLINE ---", sent_message)
+
+    def test_bridge_ask_auto_falls_back_to_text_when_ax_capture_fails(self):
+        target = {
+            "id": "t1",
+            "title": "Page",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        inspect_payload = {
+            "title": "Page",
+            "url": "https://example.test",
+            "text_snapshot": "fallback body text",
+            "text_snapshot_chars": 18,
+            "text_snapshot_truncated": False,
+        }
+        fake_session = {
+            "id": "sess_axfail",
+            "name": "sess_axfail",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=inspect_payload),
+            mock.patch(
+                "wfb.get_accessibility_tree",
+                side_effect=wfb.ChromeBridgeError("Accessibility domain unsupported"),
+            ),
+            mock.patch("wfb.get_active_session_id", return_value="sess_axfail"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok") as ask_mock,
+            mock.patch("wfb.append_turn"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["bridge", "ask", "--prompt", "summarize"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(payload["capture"]["mode_chosen"], "text")
+            self.assertIn("AX capture failed", payload["capture"]["mode_reason"])
+            self.assertEqual(
+                payload["prompt_envelope"]["budget"]["capture_mode"],
+                "text",
+            )
+            sent_message = ask_mock.call_args.kwargs["messages"][0]["text"]
+            self.assertIn("--- PAGE CONTENT ---", sent_message)
+            self.assertNotIn("--- ACCESSIBILITY OUTLINE ---", sent_message)
+
+    def test_bridge_ask_capture_mode_aom_propagates_ax_error(self):
+        target = {
+            "id": "t1",
+            "title": "Page",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch(
+                "wfb.get_accessibility_tree",
+                side_effect=wfb.ChromeBridgeError("Accessibility domain unsupported"),
+            ),
+            mock.patch("sys.stderr") as err,
+        ):
+            rc = wfb.main(
+                [
+                    "bridge",
+                    "ask",
+                    "--prompt",
+                    "summarize",
+                    "--capture-mode",
+                    "aom",
+                ]
+            )
+            self.assertEqual(rc, 5)
+            written = "".join(call.args[0] for call in err.write.call_args_list if call.args)
+            self.assertIn("capture stage failed", written)
+            self.assertIn("Accessibility domain unsupported", written)
+
+    def test_inspect_target_selector_none_forces_match_to_none(self):
+        # Even if Chrome reports false (e.g. because document.body was null),
+        # we should not surface a selector_matched=False when the user didn't
+        # supply a selector.
+        from wfb_chrome_bridge import inspect_target as _inspect
+
+        with mock.patch("wfb_chrome_bridge.CDPConnection") as conn_cls:
+            cm = conn_cls.return_value.__enter__.return_value
+            cm.call.return_value = {
+                "result": {
+                    "value": {
+                        "url": "https://example.test",
+                        "title": "X",
+                        "selected_text": "",
+                        "text_snapshot": "",
+                        "selector_matched": False,
+                    }
+                }
+            }
+            out = _inspect(ws_url="ws://127.0.0.1:9222/devtools/page/x")
+        self.assertIsNone(out["selector_matched"])
+        self.assertIsNone(out["selector"])
+
+    def test_bridge_ask_capture_mode_both_includes_text_and_aom(self):
+        target = {
+            "id": "t1",
+            "title": "Page",
+            "url": "https://example.test",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        ax_nodes = [self._ax_node("1", "main", name="Page", child_ids=["2"]),
+                    self._ax_node("2", "button", name="Go", parent_id="1")]
+        inspect_payload = {
+            "title": "Page",
+            "url": "https://example.test",
+            "text_snapshot": "page body",
+            "text_snapshot_chars": 9,
+            "text_snapshot_truncated": False,
+        }
+        fake_session = {
+            "id": "sess_both",
+            "name": "sess_both",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch("wfb._list_targets_with_port_fallback", return_value=([target], 9222)),
+            mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=inspect_payload),
+            mock.patch("wfb.get_accessibility_tree", return_value=ax_nodes),
+            mock.patch("wfb.get_active_session_id", return_value="sess_both"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok") as ask_mock,
+            mock.patch("wfb.append_turn"),
+        ):
+            rc = wfb.main(
+                [
+                    "bridge",
+                    "ask",
+                    "--prompt",
+                    "summarize",
+                    "--capture-mode",
+                    "both",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            sent_message = ask_mock.call_args.kwargs["messages"][0]["text"]
+            self.assertIn("--- ACCESSIBILITY OUTLINE ---", sent_message)
+            self.assertIn("--- PAGE CONTENT ---", sent_message)
+
     def test_list_targets_with_port_fallback_retries_detected_ports(self):
         calls: list[int] = []
 
@@ -1109,6 +1722,7 @@ class TestWfb(unittest.TestCase):
             mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "selected by heuristic ranking")),
             mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
             mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_accessibility_tree", return_value=[]),
             mock.patch("wfb.get_active_session_id", return_value="sess_abc"),
             mock.patch("wfb.load_session", return_value=fake_session),
             mock.patch("wfb.set_active_session"),
@@ -1122,8 +1736,10 @@ class TestWfb(unittest.TestCase):
             payload = json.loads(written)
             self.assertEqual(payload["capture"]["selection"]["method"], "heuristic")
             self.assertEqual(payload["capture"]["target"]["id"], "t1")
-            self.assertEqual(payload["prompt_envelope"]["template_version"], "1")
+            self.assertEqual(payload["prompt_envelope"]["template_version"], "2")
             self.assertEqual(payload["prompt_envelope"]["user_prompt"], "summarize this page")
+            self.assertEqual(payload["capture"]["mode_chosen"], "text")
+            self.assertEqual(payload["prompt_envelope"]["budget"]["capture_mode"], "text")
             self.assertEqual(payload["gemini_response"]["answer"], "The page discusses Gemini features.")
             self.assertEqual(payload["gemini_response"]["session_id"], "sess_abc")
 
@@ -1156,6 +1772,7 @@ class TestWfb(unittest.TestCase):
             mock.patch("wfb.select_capture_target", return_value=(target, "fallback_first", "first candidate")),
             mock.patch("wfb.save_attachment", return_value={"target_id": "t2"}),
             mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_accessibility_tree", return_value=[]),
             mock.patch("wfb.get_active_session_id", return_value="sess_xyz"),
             mock.patch("wfb.load_session", return_value=fake_session),
             mock.patch("wfb.set_active_session"),
@@ -1214,6 +1831,7 @@ class TestWfb(unittest.TestCase):
             mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
             mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
             mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_accessibility_tree", return_value=[]),
             mock.patch("wfb.get_active_session_id", return_value="sess_err"),
             mock.patch("wfb.load_session", return_value=fake_session),
             mock.patch("wfb.set_active_session"),
@@ -1254,6 +1872,7 @@ class TestWfb(unittest.TestCase):
             mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
             mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
             mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_accessibility_tree", return_value=[]),
             mock.patch("wfb.get_active_session_id", return_value=None),
             mock.patch("wfb.load_session", return_value=None),
             mock.patch("wfb.create_session", return_value=new_session) as create_sess,
@@ -1302,6 +1921,7 @@ class TestWfb(unittest.TestCase):
             mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
             mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
             mock.patch("wfb.inspect_target", side_effect=_changing_inspect),
+            mock.patch("wfb.get_accessibility_tree", return_value=[]),
             mock.patch("wfb.get_active_session_id", return_value="sess_loop"),
             mock.patch("wfb.load_session", return_value=fake_session),
             mock.patch("wfb.set_active_session"),
@@ -1347,6 +1967,7 @@ class TestWfb(unittest.TestCase):
             mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
             mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
             mock.patch("wfb.inspect_target", return_value=static_inspect),
+            mock.patch("wfb.get_accessibility_tree", return_value=[]),
             mock.patch("wfb.get_active_session_id", return_value="sess_stable"),
             mock.patch("wfb.load_session", return_value=fake_session),
             mock.patch("wfb.set_active_session"),
@@ -1424,6 +2045,7 @@ class TestWfb(unittest.TestCase):
             mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
             mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
             mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_accessibility_tree", return_value=[]),
             mock.patch("wfb.get_active_session_id", return_value="sess_ask_err"),
             mock.patch("wfb.load_session", return_value=fake_session),
             mock.patch("wfb.set_active_session"),
@@ -1470,6 +2092,7 @@ class TestWfb(unittest.TestCase):
             mock.patch("wfb.select_capture_target", return_value=(target, "heuristic", "ranked")),
             mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
             mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_accessibility_tree", return_value=[]),
             mock.patch("wfb.get_active_session_id", return_value="sess_txt"),
             mock.patch("wfb.load_session", return_value=fake_session),
             mock.patch("wfb.set_active_session"),

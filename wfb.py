@@ -15,15 +15,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from wfb_chrome_bridge import (
+    DEFAULT_AX_MAX_NODES,
+    DEFAULT_AX_NAME_MAX_CHARS,
     DEFAULT_DEBUG_PORT,
     ChromeBridgeError,
+    ax_quality_stats,
     choose_target,
     detect_debug_ports,
     fetch_version,
+    find_in_ax_tree,
+    find_text_matches,
+    get_accessibility_tree,
     inspect_target,
     launch_chrome_debug,
     list_targets,
+    normalize_ax_tree,
     parse_target_types,
+    render_ax_outline,
+    select_ax_subtrees,
     select_capture_target,
 )
 from wfb_chrome_session import clear_attachment, load_attachment as load_chrome_attachment, save_attachment
@@ -69,7 +78,7 @@ EXIT_DB = 4
 EXIT_IO = 5
 
 DEFAULT_STATUS_LIMIT = 5
-BRIDGE_PROMPT_TEMPLATE_VERSION = "1"
+BRIDGE_PROMPT_TEMPLATE_VERSION = "2"
 AGENT_WORKFLOW_GUIDANCE = """Agent workflow guidance:
   1) Initialize once: `wfb init`
   2) Diagnostics (blind start):
@@ -820,26 +829,249 @@ def _inspect_effective_types(
 def _build_bridge_prompt(
     *,
     user_prompt: str,
-    text_snapshot: str,
     page_title: str,
     page_url: str,
-    snapshot_chars: int,
-    snapshot_truncated: bool,
+    capture_mode: str,
+    text_snapshot: str | None = None,
+    snapshot_chars: int = 0,
+    snapshot_truncated: bool = False,
+    ax_outline_text: str | None = None,
+    ax_total_nodes: int = 0,
+    ax_rendered_nodes: int = 0,
+    ax_outline_truncated: bool = False,
 ) -> str:
-    parts = [
+    parts: list[str] = [
         f"Page title: {page_title}",
         f"Page URL: {page_url}",
-        f"Snapshot chars: {snapshot_chars}",
+        f"Capture mode: {capture_mode}",
     ]
-    if snapshot_truncated:
-        parts.append("Note: snapshot was truncated to fit max-chars limit.")
+    if text_snapshot is not None:
+        parts.append(f"Text snapshot chars: {snapshot_chars}")
+        if snapshot_truncated:
+            parts.append("Note: text snapshot was truncated to fit max-chars limit.")
+    if ax_outline_text is not None:
+        parts.append(f"AX nodes rendered: {ax_rendered_nodes}/{ax_total_nodes}")
+        if ax_outline_truncated:
+            parts.append("Note: AX outline was truncated to fit max-nodes limit.")
     parts.append("")
-    parts.append("--- PAGE CONTENT ---")
-    parts.append(text_snapshot)
-    parts.append("--- END PAGE CONTENT ---")
-    parts.append("")
+    if ax_outline_text is not None:
+        parts.append("--- ACCESSIBILITY OUTLINE ---")
+        parts.append(ax_outline_text)
+        parts.append("--- END ACCESSIBILITY OUTLINE ---")
+        parts.append("")
+    if text_snapshot is not None:
+        parts.append("--- PAGE CONTENT ---")
+        parts.append(text_snapshot)
+        parts.append("--- END PAGE CONTENT ---")
+        parts.append("")
     parts.append(f"User request: {user_prompt}")
     return "\n".join(parts)
+
+
+AOM_AUTO_MIN_MEANINGFUL_NODES = 5
+AOM_AUTO_MIN_MEANINGFUL_RATIO = 0.3
+
+
+def _decide_auto_capture_mode(stats: dict[str, Any]) -> tuple[str, str]:
+    """Return (mode_chosen, reason) for `bridge ... --capture-mode auto`."""
+    meaningful = int(stats.get("meaningful_roles", 0) or 0)
+    non_ignored = int(stats.get("non_ignored", 0) or 0)
+    ratio = float(stats.get("meaningful_ratio", 0.0) or 0.0)
+    if non_ignored == 0:
+        return "text", "AX tree empty or all nodes ignored"
+    if meaningful >= AOM_AUTO_MIN_MEANINGFUL_NODES and ratio >= AOM_AUTO_MIN_MEANINGFUL_RATIO:
+        return (
+            "aom",
+            f"meaningful_roles={meaningful} ratio={ratio:.2f} >= thresholds "
+            f"({AOM_AUTO_MIN_MEANINGFUL_NODES}, {AOM_AUTO_MIN_MEANINGFUL_RATIO})",
+        )
+    return (
+        "text",
+        f"meaningful_roles={meaningful} ratio={ratio:.2f} below thresholds "
+        f"({AOM_AUTO_MIN_MEANINGFUL_NODES}, {AOM_AUTO_MIN_MEANINGFUL_RATIO})",
+    )
+
+
+def _capture_browser_context(
+    *,
+    ws_url: str,
+    capture_mode: str,
+    max_chars: int,
+    selector: str | None,
+    ax_max_nodes: int,
+    ax_name_max_chars: int,
+    fallback_title: str = "",
+    fallback_url: str = "",
+) -> dict[str, Any]:
+    """Run text and/or AX capture for `bridge ask` / `bridge loop` and return a unified payload.
+
+    Returns dict with: page_title, page_url, mode_requested, mode_chosen,
+    mode_reason, text_snapshot (or None), snapshot_chars, snapshot_truncated,
+    ax_outline_text (or None), ax_total_nodes, ax_rendered_nodes,
+    ax_outline_truncated, ax_quality, selector, selector_matched.
+
+    Raises ChromeBridgeError on CDP failure.
+    """
+    mode_requested = capture_mode
+    mode_reason = f"requested={capture_mode}"
+
+    text_snapshot: str | None = None
+    snapshot_chars = 0
+    snapshot_truncated = False
+    selector_matched: bool | None = None
+    page_title = fallback_title
+    page_url = fallback_url
+
+    needs_text = capture_mode in ("text", "both")
+    needs_aom = capture_mode in ("aom", "both", "auto")
+
+    text_payload: dict[str, Any] | None = None
+    if needs_text:
+        text_payload = inspect_target(
+            ws_url=ws_url,
+            max_chars=max_chars,
+            selector=selector,
+        )
+        text_snapshot = str(text_payload.get("text_snapshot", ""))
+        snapshot_chars = int(text_payload.get("text_snapshot_chars", len(text_snapshot)))
+        snapshot_truncated = bool(text_payload.get("text_snapshot_truncated", False))
+        selector_matched = text_payload.get("selector_matched")
+        page_title = str(text_payload.get("title", page_title))
+        page_url = str(text_payload.get("url", page_url))
+
+    raw_nodes: list[dict[str, Any]] = []
+    normalized: list[dict[str, Any]] = []
+    ax_failure: str | None = None
+    if needs_aom:
+        try:
+            raw_nodes = get_accessibility_tree(ws_url=ws_url)
+            normalized = normalize_ax_tree(raw_nodes)
+        except ChromeBridgeError as ax_err:
+            if capture_mode == "aom":
+                # User explicitly asked for AOM; surface the error.
+                raise
+            ax_failure = str(ax_err)
+
+    stats = ax_quality_stats(normalized) if normalized else ax_quality_stats([])
+    mode_chosen = capture_mode
+
+    if capture_mode == "auto":
+        if ax_failure is not None:
+            mode_chosen = "text"
+            mode_reason = f"auto: AX capture failed ({ax_failure}); falling back to text"
+        else:
+            mode_chosen, auto_reason = _decide_auto_capture_mode(stats)
+            mode_reason = f"auto: {auto_reason}"
+        if mode_chosen == "text" and text_payload is None:
+            text_payload = inspect_target(
+                ws_url=ws_url,
+                max_chars=max_chars,
+                selector=selector,
+            )
+            text_snapshot = str(text_payload.get("text_snapshot", ""))
+            snapshot_chars = int(text_payload.get("text_snapshot_chars", len(text_snapshot)))
+            snapshot_truncated = bool(text_payload.get("text_snapshot_truncated", False))
+            selector_matched = text_payload.get("selector_matched")
+            page_title = str(text_payload.get("title", page_title))
+            page_url = str(text_payload.get("url", page_url))
+    elif capture_mode == "both" and ax_failure is not None:
+        # Degrade gracefully: keep the text snapshot we already fetched, drop AOM.
+        mode_chosen = "text"
+        mode_reason = (
+            f"requested=both, AX capture failed ({ax_failure}); rendering text only"
+        )
+
+    ax_outline_text: str | None = None
+    ax_total_nodes = 0
+    ax_rendered_nodes = 0
+    ax_outline_truncated = False
+    if mode_chosen in ("aom", "both") and normalized:
+        outline = render_ax_outline(
+            normalized,
+            max_nodes=ax_max_nodes,
+            name_max_chars=ax_name_max_chars,
+        )
+        ax_outline_text = outline["text"]
+        ax_total_nodes = outline["total_count"]
+        ax_rendered_nodes = outline["rendered_count"]
+        ax_outline_truncated = outline["truncated"]
+
+    include_text_in_prompt = mode_chosen in ("text", "both")
+    include_ax_in_prompt = mode_chosen in ("aom", "both")
+
+    return {
+        "page_title": page_title,
+        "page_url": page_url,
+        "mode_requested": mode_requested,
+        "mode_chosen": mode_chosen,
+        "mode_reason": mode_reason,
+        "ax_failure": ax_failure,
+        "text_snapshot": text_snapshot if include_text_in_prompt else None,
+        "snapshot_chars": snapshot_chars,
+        "snapshot_truncated": snapshot_truncated,
+        "ax_outline_text": ax_outline_text if include_ax_in_prompt else None,
+        "ax_total_nodes": ax_total_nodes,
+        "ax_rendered_nodes": ax_rendered_nodes,
+        "ax_outline_truncated": ax_outline_truncated,
+        "ax_quality": stats,
+        "selector": selector,
+        "selector_matched": selector_matched,
+    }
+
+
+def _resolve_chrome_read_target(
+    *,
+    home: Path,
+    argv: list[str],
+    target_id: str | None,
+    port: int | None,
+    include_types_arg: str | None,
+) -> tuple[dict[str, Any], str, int, int]:
+    """Resolve a Chrome target for read commands (chrome ax, chrome find).
+
+    Returns (target, ws_url, requested_port, resolved_port).
+    Raises ChromeBridgeError on resolution failure.
+    """
+    selected_types = parse_target_types(include_types_arg)
+    include_types_explicit = _has_flag(argv, "--include-types")
+
+    if target_id:
+        requested_port = port if port is not None else DEFAULT_DEBUG_PORT
+        target, _targets, resolved_port = _resolve_inspect_target_on_ports(
+            requested_port=requested_port,
+            include_types=selected_types,
+            target_id=str(target_id),
+        )
+    else:
+        attachment = load_chrome_attachment(home)
+        if attachment is None:
+            raise ChromeBridgeError(
+                "no attached Chrome target; run `wfb chrome attach --target-id ...`"
+            )
+        target_key_raw = attachment.get("target_id", "")
+        target_key = str(target_key_raw) if isinstance(target_key_raw, str) else ""
+        if not target_key:
+            raise ChromeBridgeError("persisted attachment is missing target_id")
+        if port is None:
+            saved_port = attachment.get("debug_port")
+            port = int(saved_port) if isinstance(saved_port, int) else DEFAULT_DEBUG_PORT
+        requested_port = int(port)
+        selected_types = _inspect_effective_types(
+            selected_types=selected_types,
+            include_types_explicit=include_types_explicit,
+            attachment=attachment,
+        )
+        targets, resolved_port = _list_targets_with_port_fallback(
+            port=requested_port,
+            include_types=selected_types,
+            gemini_only=False,
+        )
+        target = choose_target(targets, target_key)
+
+    ws_url = str(target.get("webSocketDebuggerUrl", ""))
+    if not ws_url:
+        raise ChromeBridgeError("target has no websocket debugger url")
+    return target, ws_url, requested_port, resolved_port
 
 
 def _annotate_sync_envelope(
@@ -1291,6 +1523,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=4000,
         help="max snapshot text chars (default: 4000)",
     )
+    c_inspect.add_argument(
+        "--selector",
+        help="optional CSS selector restricting text snapshot to a subtree",
+    )
     c_inspect.add_argument("--format", choices=("text", "json"), default="json")
     c_inspect.add_argument(
         "--include-types",
@@ -1322,7 +1558,130 @@ def build_parser() -> argparse.ArgumentParser:
         default=4000,
         help="max snapshot text chars (default: 4000)",
     )
+    c_capture.add_argument(
+        "--selector",
+        help="optional CSS selector restricting text snapshot to a subtree",
+    )
     c_capture.add_argument("--format", choices=("json", "text"), default="json")
+
+    c_ax = chrome_sub.add_parser(
+        "ax",
+        help="capture page accessibility tree (AOM) as outline or JSON",
+        description=(
+            "Read the page Accessibility Tree using CDP `Accessibility.getFullAXTree`.\n"
+            "Outline format is screen-reader-style and dramatically more token-efficient\n"
+            "than `chrome inspect` text on structured pages."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    c_ax.add_argument("--target-id", help="override persisted target id for this call")
+    c_ax.add_argument("--port", type=int, help="override debug port")
+    c_ax.add_argument(
+        "--include-types",
+        default="page,webview",
+        help="comma-separated target types to search when resolving ids (default: page,webview)",
+    )
+    c_ax.add_argument("--role", help="filter to subtrees rooted at nodes matching role (exact)")
+    c_ax.add_argument(
+        "--name",
+        help="filter to subtrees rooted at nodes whose accessible name contains this substring",
+    )
+    c_ax.add_argument(
+        "--depth",
+        type=int,
+        default=None,
+        help="optional max AX tree depth (passed through to CDP getFullAXTree)",
+    )
+    c_ax.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_AX_MAX_NODES,
+        help=f"cap on rendered AX nodes (default: {DEFAULT_AX_MAX_NODES})",
+    )
+    c_ax.add_argument(
+        "--name-max-chars",
+        type=int,
+        default=DEFAULT_AX_NAME_MAX_CHARS,
+        help=f"truncate accessible names beyond N chars (default: {DEFAULT_AX_NAME_MAX_CHARS})",
+    )
+    c_ax.add_argument(
+        "--ignored",
+        choices=("on", "off"),
+        default="off",
+        help="include AX nodes flagged as ignored (default: off)",
+    )
+    c_ax.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=5.0,
+        help="CDP request timeout seconds (default: 5.0)",
+    )
+    c_ax.add_argument("--format", choices=("outline", "json"), default="outline")
+
+    c_find = chrome_sub.add_parser(
+        "find",
+        help="search page text and accessibility tree for a query string",
+        description=(
+            "Search the current page for a substring across the text snapshot and/or\n"
+            "AX node names. Returns matches with surrounding context (text mode) and\n"
+            "role/name breadcrumbs (AOM mode). Replaces the 'raise --max-chars and\n"
+            "retry' workflow."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    c_find.add_argument("--query", required=True, help="case-insensitive substring to search for")
+    c_find.add_argument(
+        "--mode",
+        choices=("text", "aom", "both"),
+        default="both",
+        help="which sources to search (default: both)",
+    )
+    c_find.add_argument("--target-id", help="override persisted target id for this call")
+    c_find.add_argument("--port", type=int, help="override debug port")
+    c_find.add_argument(
+        "--include-types",
+        default="page,webview",
+        help="comma-separated target types to search when resolving ids (default: page,webview)",
+    )
+    c_find.add_argument(
+        "--selector",
+        help="optional CSS selector restricting text-mode search to a subtree",
+    )
+    c_find.add_argument(
+        "--role",
+        help="restrict AOM-mode search to nodes whose role matches exactly",
+    )
+    c_find.add_argument(
+        "--max-results",
+        type=int,
+        default=10,
+        help="max matches returned per source mode (default: 10)",
+    )
+    c_find.add_argument(
+        "--context-chars",
+        type=int,
+        default=200,
+        help="text-mode context window chars on each side of match (default: 200)",
+    )
+    c_find.add_argument(
+        "--max-chars",
+        type=int,
+        default=200000,
+        help="max text snapshot chars to scan (default: 200000)",
+    )
+    c_find.add_argument(
+        "--ax-depth",
+        type=int,
+        default=None,
+        help="optional AX tree depth limit",
+    )
+    c_find.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=5.0,
+        help="CDP request timeout seconds (default: 5.0)",
+    )
+    c_find.add_argument("--format", choices=("text", "json"), default="json")
 
     bridge = sub.add_parser(
         "bridge",
@@ -1359,6 +1718,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4000,
         help="max snapshot text chars (default: 4000)",
+    )
+    b_ask.add_argument(
+        "--selector",
+        help="optional CSS selector restricting text snapshot to a subtree",
+    )
+    b_ask.add_argument(
+        "--capture-mode",
+        choices=("text", "aom", "both", "auto"),
+        default="auto",
+        help=(
+            "browser capture strategy (default: auto). 'auto' picks AOM when the page has "
+            "meaningful roles, otherwise text."
+        ),
+    )
+    b_ask.add_argument(
+        "--ax-max-nodes",
+        type=int,
+        default=DEFAULT_AX_MAX_NODES,
+        help=f"cap on rendered AX nodes when capture-mode includes AOM (default: {DEFAULT_AX_MAX_NODES})",
+    )
+    b_ask.add_argument(
+        "--ax-name-max-chars",
+        type=int,
+        default=DEFAULT_AX_NAME_MAX_CHARS,
+        help=f"truncate accessible names beyond N chars (default: {DEFAULT_AX_NAME_MAX_CHARS})",
     )
     b_ask.add_argument("--format", choices=("json", "text"), default="json")
 
@@ -1397,6 +1781,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4000,
         help="max snapshot text chars (default: 4000)",
+    )
+    b_loop.add_argument(
+        "--selector",
+        help="optional CSS selector restricting text snapshot to a subtree",
+    )
+    b_loop.add_argument(
+        "--capture-mode",
+        choices=("text", "aom", "both", "auto"),
+        default="auto",
+        help=(
+            "browser capture strategy per iteration (default: auto). "
+            "'auto' picks AOM when the page has meaningful roles, otherwise text."
+        ),
+    )
+    b_loop.add_argument(
+        "--ax-max-nodes",
+        type=int,
+        default=DEFAULT_AX_MAX_NODES,
+        help=f"cap on rendered AX nodes when capture-mode includes AOM (default: {DEFAULT_AX_MAX_NODES})",
+    )
+    b_loop.add_argument(
+        "--ax-name-max-chars",
+        type=int,
+        default=DEFAULT_AX_NAME_MAX_CHARS,
+        help=f"truncate accessible names beyond N chars (default: {DEFAULT_AX_NAME_MAX_CHARS})",
     )
     b_loop.add_argument("--format", choices=("json", "text"), default="json")
 
@@ -1945,7 +2354,13 @@ def main(argv: list[str] | None = None) -> int:
                     ws_url=ws_url,
                     timeout_seconds=args.timeout_seconds,
                     max_chars=args.max_chars,
+                    selector=args.selector,
                 )
+                if args.selector and context.get("selector_matched") is False:
+                    _err(
+                        f"wfb: selector did not match any element: {args.selector!r}; "
+                        "snapshot is empty (use `wfb chrome ax` or relax the selector)."
+                    )
                 _maybe_warn_empty_snapshot(
                     str(context.get("text_snapshot", "")),
                     context="chrome inspect",
@@ -2060,7 +2475,13 @@ def main(argv: list[str] | None = None) -> int:
                 inspect_payload = inspect_target(
                     ws_url=ws_url,
                     max_chars=args.max_chars,
+                    selector=args.selector,
                 )
+                if args.selector and inspect_payload.get("selector_matched") is False:
+                    _err(
+                        f"wfb: selector did not match any element: {args.selector!r}; "
+                        "snapshot is empty (use `wfb chrome ax` or relax the selector)."
+                    )
                 _maybe_warn_empty_snapshot(
                     str(inspect_payload.get("text_snapshot", "")),
                     context="chrome capture",
@@ -2088,6 +2509,268 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"url: {payload['target']['url']}")
                     print(f"debug_port: {resolved_port}")
                     print(payload["inspect"].get("text_snapshot", ""))
+                return EXIT_OK
+
+            if args.chrome_command == "ax":
+                if args.max_nodes <= 0:
+                    _err("--max-nodes must be positive")
+                    return EXIT_USAGE
+                if args.name_max_chars <= 0:
+                    _err("--name-max-chars must be positive")
+                    return EXIT_USAGE
+                if args.timeout_seconds <= 0:
+                    _err("--timeout-seconds must be positive")
+                    return EXIT_USAGE
+                if args.depth is not None and args.depth < 0:
+                    _err("--depth must be non-negative")
+                    return EXIT_USAGE
+                ax_requested_port = (
+                    int(args.port) if isinstance(args.port, int) else DEFAULT_DEBUG_PORT
+                )
+                try:
+                    target, ws_url, ax_requested_port, ax_resolved_port = (
+                        _resolve_chrome_read_target(
+                            home=wfb_home(),
+                            argv=argv,
+                            target_id=args.target_id,
+                            port=args.port,
+                            include_types_arg=args.include_types,
+                        )
+                    )
+                except ChromeBridgeError as e:
+                    _err(
+                        _chrome_failure_message(
+                            f"{e}; try --include-types page,webview; "
+                            f"{_chrome_recovery_hint(ax_requested_port)}",
+                            requested_port=int(ax_requested_port),
+                        )
+                    )
+                    return EXIT_IO
+                try:
+                    raw_nodes = get_accessibility_tree(
+                        ws_url=ws_url,
+                        depth=args.depth,
+                        timeout_seconds=args.timeout_seconds,
+                    )
+                except ChromeBridgeError as e:
+                    _err(
+                        _chrome_failure_message(
+                            f"AX capture failed: {e}",
+                            requested_port=int(ax_requested_port),
+                            resolved_port=int(ax_resolved_port),
+                        )
+                    )
+                    return EXIT_IO
+                normalized = normalize_ax_tree(raw_nodes)
+                include_ignored = args.ignored == "on"
+                selected_nodes = select_ax_subtrees(
+                    normalized,
+                    role=args.role,
+                    name=args.name,
+                    include_ignored=include_ignored,
+                )
+                outline = render_ax_outline(
+                    selected_nodes,
+                    max_nodes=args.max_nodes,
+                    name_max_chars=args.name_max_chars,
+                    include_ignored=include_ignored,
+                )
+                stats = ax_quality_stats(normalized)
+                debug_meta = _inspect_debug_meta(
+                    requested_port=ax_requested_port,
+                    resolved_port=ax_resolved_port,
+                )
+                if args.format == "json":
+                    payload: dict[str, Any] = {
+                        "target": {
+                            "id": str(target.get("id", "")),
+                            "title": str(target.get("title", "")),
+                            "url": str(target.get("url", "")),
+                            "type": str(target.get("type", "")),
+                        },
+                        "outline": outline["text"],
+                        "outline_meta": {
+                            "rendered_count": outline["rendered_count"],
+                            "total_count": outline["total_count"],
+                            "selected_count": len(selected_nodes),
+                            "outline_truncated": outline["truncated"],
+                        },
+                        "ax_quality": stats,
+                        "filters": {
+                            "role": args.role,
+                            "name": args.name,
+                            "include_ignored": include_ignored,
+                            "depth": args.depth,
+                            "max_nodes": args.max_nodes,
+                            "name_max_chars": args.name_max_chars,
+                        },
+                        "nodes": selected_nodes,
+                        "debug": debug_meta,
+                    }
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    if outline["text"]:
+                        print(outline["text"])
+                    print(
+                        f"# total_nodes={outline['total_count']} "
+                        f"rendered={outline['rendered_count']} "
+                        f"truncated={outline['truncated']} "
+                        f"meaningful_roles={stats['meaningful_roles']} "
+                        f"target={target.get('title','')!r}"
+                    )
+                return EXIT_OK
+
+            if args.chrome_command == "find":
+                if args.max_results <= 0:
+                    _err("--max-results must be positive")
+                    return EXIT_USAGE
+                if args.context_chars < 0:
+                    _err("--context-chars must be non-negative")
+                    return EXIT_USAGE
+                if args.max_chars <= 0:
+                    _err("--max-chars must be positive")
+                    return EXIT_USAGE
+                if args.timeout_seconds <= 0:
+                    _err("--timeout-seconds must be positive")
+                    return EXIT_USAGE
+                if not args.query.strip():
+                    _err("--query must be a non-empty string")
+                    return EXIT_USAGE
+                find_requested_port = (
+                    int(args.port) if isinstance(args.port, int) else DEFAULT_DEBUG_PORT
+                )
+                try:
+                    target, ws_url, find_requested_port, find_resolved_port = (
+                        _resolve_chrome_read_target(
+                            home=wfb_home(),
+                            argv=argv,
+                            target_id=args.target_id,
+                            port=args.port,
+                            include_types_arg=args.include_types,
+                        )
+                    )
+                except ChromeBridgeError as e:
+                    _err(
+                        _chrome_failure_message(
+                            f"{e}; try --include-types page,webview; "
+                            f"{_chrome_recovery_hint(find_requested_port)}",
+                            requested_port=int(find_requested_port),
+                        )
+                    )
+                    return EXIT_IO
+
+                text_matches: list[dict[str, Any]] = []
+                ax_matches: list[dict[str, Any]] = []
+                text_snapshot_meta: dict[str, Any] = {}
+                ax_meta: dict[str, Any] = {}
+
+                if args.mode in ("text", "both"):
+                    try:
+                        snap = inspect_target(
+                            ws_url=ws_url,
+                            timeout_seconds=args.timeout_seconds,
+                            max_chars=args.max_chars,
+                            selector=args.selector,
+                        )
+                    except ChromeBridgeError as e:
+                        _err(
+                            _chrome_failure_message(
+                                f"text snapshot failed: {e}",
+                                requested_port=int(find_requested_port),
+                                resolved_port=int(find_resolved_port),
+                            )
+                        )
+                        return EXIT_IO
+                    selector_matched = snap.get("selector_matched")
+                    if args.selector and selector_matched is False:
+                        _err(
+                            f"wfb: selector did not match any element: {args.selector!r}; "
+                            "text-mode results will be empty."
+                        )
+                    text_snapshot = str(snap.get("text_snapshot", ""))
+                    text_matches = find_text_matches(
+                        text=text_snapshot,
+                        query=args.query,
+                        max_results=args.max_results,
+                        context_chars=args.context_chars,
+                    )
+                    text_snapshot_meta = {
+                        "title": str(snap.get("title", "")),
+                        "url": str(snap.get("url", "")),
+                        "selector": args.selector,
+                        "selector_matched": selector_matched,
+                        "text_snapshot_chars": int(snap.get("text_snapshot_chars", len(text_snapshot))),
+                        "text_snapshot_truncated": bool(snap.get("text_snapshot_truncated", False)),
+                    }
+
+                if args.mode in ("aom", "both"):
+                    try:
+                        raw_nodes = get_accessibility_tree(
+                            ws_url=ws_url,
+                            depth=args.ax_depth,
+                            timeout_seconds=args.timeout_seconds,
+                        )
+                    except ChromeBridgeError as e:
+                        _err(
+                            _chrome_failure_message(
+                                f"AX capture failed: {e}",
+                                requested_port=int(find_requested_port),
+                                resolved_port=int(find_resolved_port),
+                            )
+                        )
+                        return EXIT_IO
+                    normalized = normalize_ax_tree(raw_nodes)
+                    ax_matches = find_in_ax_tree(
+                        normalized,
+                        query=args.query,
+                        role=args.role,
+                        max_results=args.max_results,
+                    )
+                    ax_meta = {
+                        "ax_quality": ax_quality_stats(normalized),
+                        "ax_total_nodes": len(normalized),
+                        "role_filter": args.role,
+                    }
+
+                debug_meta = _inspect_debug_meta(
+                    requested_port=find_requested_port,
+                    resolved_port=find_resolved_port,
+                )
+                if args.format == "json":
+                    payload = {
+                        "query": args.query,
+                        "mode": args.mode,
+                        "target": {
+                            "id": str(target.get("id", "")),
+                            "title": str(target.get("title", "")),
+                            "url": str(target.get("url", "")),
+                            "type": str(target.get("type", "")),
+                        },
+                        "text_matches": text_matches,
+                        "ax_matches": ax_matches,
+                        "text_meta": text_snapshot_meta,
+                        "ax_meta": ax_meta,
+                        "debug": debug_meta,
+                    }
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                else:
+                    print(f"query: {args.query!r}")
+                    print(f"target: {target.get('title','')} ({target.get('url','')})")
+                    print(f"text_matches: {len(text_matches)}")
+                    for i, m in enumerate(text_matches, start=1):
+                        before = m.get("before", "").replace("\n", " ")
+                        after = m.get("after", "").replace("\n", " ")
+                        print(f"  [{i}] @{m.get('offset')} ...{before}[{m.get('match')}]{after}...")
+                    print(f"ax_matches: {len(ax_matches)}")
+                    for i, m in enumerate(ax_matches, start=1):
+                        path = " > ".join(
+                            f"{p.get('role') or '?'}"
+                            + (f" {p.get('name')!r}" if p.get("name") else "")
+                            for p in (m.get("path") or [])
+                        )
+                        name = m.get("name") or ""
+                        role = m.get("role") or "?"
+                        print(f"  [{i}] {role} name={name!r} path={path}")
                 return EXIT_OK
         except ChromeBridgeError as e:
             rp = locals().get("resolved_port")
@@ -2196,25 +2879,51 @@ def main(argv: list[str] | None = None) -> int:
                     debug_port=resolved_port,
                     target_type=str(target.get("type", "")),
                 )
-                inspect_result = inspect_target(
-                    ws_url=ws_url,
-                    max_chars=args.max_chars,
-                )
-                text_snapshot = str(inspect_result.get("text_snapshot", ""))
-                _maybe_warn_empty_snapshot(text_snapshot, context="bridge ask")
+                try:
+                    capture_result = _capture_browser_context(
+                        ws_url=ws_url,
+                        capture_mode=args.capture_mode,
+                        max_chars=args.max_chars,
+                        selector=args.selector,
+                        ax_max_nodes=args.ax_max_nodes,
+                        ax_name_max_chars=args.ax_name_max_chars,
+                        fallback_title=str(target.get("title", "")),
+                        fallback_url=str(target.get("url", "")),
+                    )
+                except ChromeBridgeError as e:
+                    _err(
+                        _chrome_failure_message(
+                            f"capture stage failed: {e}",
+                            requested_port=int(args.port),
+                            resolved_port=int(resolved_port),
+                        )
+                    )
+                    return EXIT_IO
+                if args.selector and capture_result.get("selector_matched") is False:
+                    _err(
+                        f"wfb: selector did not match any element: {args.selector!r}; "
+                        "snapshot is empty (use `wfb chrome ax` or relax the selector)."
+                    )
+                if capture_result.get("text_snapshot") is not None:
+                    _maybe_warn_empty_snapshot(
+                        str(capture_result.get("text_snapshot") or ""),
+                        context="bridge ask",
+                    )
 
-                page_title = str(inspect_result.get("title", target.get("title", "")))
-                page_url = str(inspect_result.get("url", target.get("url", "")))
-                snapshot_chars = int(inspect_result.get("text_snapshot_chars", len(text_snapshot)))
-                snapshot_truncated = bool(inspect_result.get("text_snapshot_truncated", False))
-
+                page_title = capture_result["page_title"]
+                page_url = capture_result["page_url"]
                 composed_prompt = _build_bridge_prompt(
                     user_prompt=args.prompt,
-                    text_snapshot=text_snapshot,
                     page_title=page_title,
                     page_url=page_url,
-                    snapshot_chars=snapshot_chars,
-                    snapshot_truncated=snapshot_truncated,
+                    capture_mode=capture_result["mode_chosen"],
+                    text_snapshot=capture_result["text_snapshot"],
+                    snapshot_chars=capture_result["snapshot_chars"],
+                    snapshot_truncated=capture_result["snapshot_truncated"],
+                    ax_outline_text=capture_result["ax_outline_text"],
+                    ax_total_nodes=capture_result["ax_total_nodes"],
+                    ax_rendered_nodes=capture_result["ax_rendered_nodes"],
+                    ax_outline_truncated=capture_result["ax_outline_truncated"],
                 )
 
                 sid = args.session or get_active_session_id(wfb_home())
@@ -2259,14 +2968,28 @@ def main(argv: list[str] | None = None) -> int:
                             "url": page_url,
                             "type": str(target.get("type", "")),
                         },
-                        "snapshot_chars": snapshot_chars,
-                        "snapshot_truncated": snapshot_truncated,
+                        "snapshot_chars": capture_result["snapshot_chars"],
+                        "snapshot_truncated": capture_result["snapshot_truncated"],
+                        "selector": capture_result["selector"],
+                        "selector_matched": capture_result["selector_matched"],
+                        "mode_requested": capture_result["mode_requested"],
+                        "mode_chosen": capture_result["mode_chosen"],
+                        "mode_reason": capture_result["mode_reason"],
+                        "ax_quality": capture_result["ax_quality"],
                         "debug": {"requested_port": int(args.port), "resolved_port": int(resolved_port)},
                     },
                     "prompt_envelope": {
                         "template_version": BRIDGE_PROMPT_TEMPLATE_VERSION,
                         "user_prompt": args.prompt,
                         "composed_prompt_chars": len(composed_prompt),
+                        "budget": {
+                            "capture_mode": capture_result["mode_chosen"],
+                            "text_snapshot_chars": capture_result["snapshot_chars"],
+                            "text_snapshot_truncated": capture_result["snapshot_truncated"],
+                            "ax_total_nodes": capture_result["ax_total_nodes"],
+                            "ax_rendered_nodes": capture_result["ax_rendered_nodes"],
+                            "ax_outline_truncated": capture_result["ax_outline_truncated"],
+                        },
                     },
                     "gemini_response": {
                         "model": model,
@@ -2279,6 +3002,7 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     print(f"target: {page_title} ({page_url})")
                     print(f"selection: {selection_method}")
+                    print(f"capture_mode: {capture_result['mode_chosen']}")
                     print(f"model: {model}")
                     print(f"session: {sid}")
                     print("---")
@@ -2379,9 +3103,15 @@ def main(argv: list[str] | None = None) -> int:
                     )
 
                     try:
-                        inspect_result = inspect_target(
+                        capture_result = _capture_browser_context(
                             ws_url=ws_url,
+                            capture_mode=args.capture_mode,
                             max_chars=args.max_chars,
+                            selector=args.selector,
+                            ax_max_nodes=args.ax_max_nodes,
+                            ax_name_max_chars=args.ax_name_max_chars,
+                            fallback_title=str(target.get("title", "")),
+                            fallback_url=str(target.get("url", "")),
                         )
                     except ChromeBridgeError as e:
                         step["status"] = "error"
@@ -2394,14 +3124,31 @@ def main(argv: list[str] | None = None) -> int:
                         stop_reason = "error"
                         break
 
-                    text_snapshot = str(inspect_result.get("text_snapshot", ""))
-                    _maybe_warn_empty_snapshot(text_snapshot, context="bridge loop")
-                    page_title = str(inspect_result.get("title", target.get("title", "")))
-                    page_url = str(inspect_result.get("url", target.get("url", "")))
-                    snapshot_chars = int(inspect_result.get("text_snapshot_chars", len(text_snapshot)))
-                    snapshot_truncated = bool(inspect_result.get("text_snapshot_truncated", False))
+                    if args.selector and capture_result.get("selector_matched") is False:
+                        _err(
+                            f"wfb: selector did not match any element: {args.selector!r}; "
+                            "snapshot is empty (use `wfb chrome ax` or relax the selector)."
+                        )
+                    if capture_result.get("text_snapshot") is not None:
+                        _maybe_warn_empty_snapshot(
+                            str(capture_result.get("text_snapshot") or ""),
+                            context="bridge loop",
+                        )
 
-                    if stability_check and iteration_num > 1 and text_snapshot == prev_snapshot:
+                    page_title = capture_result["page_title"]
+                    page_url = capture_result["page_url"]
+                    stability_signature = "\n".join(
+                        s for s in (
+                            capture_result.get("text_snapshot") or "",
+                            capture_result.get("ax_outline_text") or "",
+                        ) if s
+                    )
+
+                    if (
+                        stability_check
+                        and iteration_num > 1
+                        and stability_signature == prev_snapshot
+                    ):
                         step["capture"] = {
                             "selection": {"method": selection_method, "reason": selection_reason},
                             "target": {
@@ -2410,23 +3157,34 @@ def main(argv: list[str] | None = None) -> int:
                                 "url": page_url,
                                 "type": str(target.get("type", "")),
                             },
-                            "snapshot_chars": snapshot_chars,
-                            "snapshot_truncated": snapshot_truncated,
+                            "snapshot_chars": capture_result["snapshot_chars"],
+                            "snapshot_truncated": capture_result["snapshot_truncated"],
+                            "selector": capture_result["selector"],
+                            "selector_matched": capture_result["selector_matched"],
+                            "mode_requested": capture_result["mode_requested"],
+                            "mode_chosen": capture_result["mode_chosen"],
+                            "mode_reason": capture_result["mode_reason"],
+                            "ax_quality": capture_result["ax_quality"],
                             "debug": {"requested_port": int(args.port), "resolved_port": int(resolved_port)},
                         }
                         step["status"] = "no_change"
                         iterations.append(step)
                         stop_reason = "no_change"
                         break
-                    prev_snapshot = text_snapshot
+                    prev_snapshot = stability_signature
 
                     composed_prompt = _build_bridge_prompt(
                         user_prompt=args.prompt,
-                        text_snapshot=text_snapshot,
                         page_title=page_title,
                         page_url=page_url,
-                        snapshot_chars=snapshot_chars,
-                        snapshot_truncated=snapshot_truncated,
+                        capture_mode=capture_result["mode_chosen"],
+                        text_snapshot=capture_result["text_snapshot"],
+                        snapshot_chars=capture_result["snapshot_chars"],
+                        snapshot_truncated=capture_result["snapshot_truncated"],
+                        ax_outline_text=capture_result["ax_outline_text"],
+                        ax_total_nodes=capture_result["ax_total_nodes"],
+                        ax_rendered_nodes=capture_result["ax_rendered_nodes"],
+                        ax_outline_truncated=capture_result["ax_outline_truncated"],
                     )
 
                     try:
@@ -2454,14 +3212,28 @@ def main(argv: list[str] | None = None) -> int:
                             "url": page_url,
                             "type": str(target.get("type", "")),
                         },
-                        "snapshot_chars": snapshot_chars,
-                        "snapshot_truncated": snapshot_truncated,
+                        "snapshot_chars": capture_result["snapshot_chars"],
+                        "snapshot_truncated": capture_result["snapshot_truncated"],
+                        "selector": capture_result["selector"],
+                        "selector_matched": capture_result["selector_matched"],
+                        "mode_requested": capture_result["mode_requested"],
+                        "mode_chosen": capture_result["mode_chosen"],
+                        "mode_reason": capture_result["mode_reason"],
+                        "ax_quality": capture_result["ax_quality"],
                         "debug": {"requested_port": int(args.port), "resolved_port": int(resolved_port)},
                     }
                     step["prompt_envelope"] = {
                         "template_version": BRIDGE_PROMPT_TEMPLATE_VERSION,
                         "user_prompt": args.prompt,
                         "composed_prompt_chars": len(composed_prompt),
+                        "budget": {
+                            "capture_mode": capture_result["mode_chosen"],
+                            "text_snapshot_chars": capture_result["snapshot_chars"],
+                            "text_snapshot_truncated": capture_result["snapshot_truncated"],
+                            "ax_total_nodes": capture_result["ax_total_nodes"],
+                            "ax_rendered_nodes": capture_result["ax_rendered_nodes"],
+                            "ax_outline_truncated": capture_result["ax_outline_truncated"],
+                        },
                     }
                     step["gemini_response"] = {
                         "model": model,
