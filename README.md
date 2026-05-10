@@ -13,8 +13,10 @@ Direct attachment to active browser Gemini side-panel sessions is not available 
 
 - **Debug instance only:** `wfb` only sees tabs on the Chrome process that exposes the remote-debug HTTP endpoint for the port and profile you use. A normal daily browser window without remote debugging does not appear in `wfb chrome targets`.
 - **Blind or recovery start:** Run `wfb bridge doctor --format json` for endpoint reachability, requested vs resolved port, attachment state, and suggested next commands.
-- **Port probing:** `wfb chrome capture`, `wfb chrome inspect`, and `wfb bridge …` try the requested port first, then other detected debug ports. **`wfb chrome targets` and `wfb chrome attach` use `--port` only** (no automatic fallback). Use the port from doctor or pass `--port` explicitly when listing or attaching.
-- **Metadata vs snapshot:** `chrome targets` and doctor list ids, titles, URLs, and types. **`capture`**, **`inspect`**, and **`bridge`** read bounded page text. Sensitive URLs still show up in listings.
+- **Port probing:** `wfb chrome capture`, `wfb chrome inspect`, `wfb chrome ax`, `wfb chrome find`, and `wfb bridge …` try the requested port first, then other detected debug ports. **`wfb chrome targets` and `wfb chrome attach` use `--port` only** (no automatic fallback). Use the port from doctor or pass `--port` explicitly when listing or attaching.
+- **Metadata vs snapshot:** `chrome targets` and doctor list ids, titles, URLs, and types. **`capture`**, **`inspect`**, **`ax`**, **`find`**, and **`bridge`** read bounded page text or accessibility data. Sensitive URLs still show up in listings.
+- **AOM first on structured pages:** Prefer `wfb chrome ax --format outline` over raising `--max-chars` on `chrome inspect`. The accessibility tree is screen-reader-style and dramatically more token-efficient than `body.innerText` for chat logs, forms, and component-heavy UIs. Use `wfb chrome find --query "..."` to locate text without re-fetching ever-larger snapshots.
+- **Auto capture mode:** `wfb bridge ask` and `wfb bridge loop` default to `--capture-mode auto`, which inspects the AX tree, picks AOM when the page has meaningful structure, and falls back to text otherwise. Override with `--capture-mode text|aom|both` when you want a fixed strategy.
 - **Internal Chrome URLs:** `chrome://…` pages often produce empty or unhelpful snapshots compared with normal `https://` tabs. When several targets exist (for example Google AI internal UI vs the search results page), prefer **`--target-id`** from `chrome targets`.
 
 ## What Works Today
@@ -26,7 +28,7 @@ Direct attachment to active browser Gemini side-panel sessions is not available 
 - `wfb gemini ask` sends prompts to Gemini with local session continuity.
 - `wfb gemini session ...` creates, switches, lists, resets, and inspects local chat sessions.
 - `wfb gemini ask --auto-summarize on` can compact long local sessions with a Gemini-generated summary.
-- `wfb chrome ...` can launch a debuggable Chrome instance, list page targets, attach one target, and inspect bounded tab text context.
+- `wfb chrome ...` can launch a debuggable Chrome instance, list page targets, attach one target, inspect bounded tab text context, capture the page accessibility tree (`chrome ax`), and search the page text and AX tree (`chrome find`).
 
 Still not supported:
 
@@ -189,7 +191,7 @@ Stores the selected target in `~/.wfb/chrome_attachment.json` for later inspecti
 - Default target types searched: `page`.
 - Use `--include-types page,webview` when attaching Gemini side-panel IDs.
 
-### `wfb chrome inspect [--target-id ID] [--port N] [--include-types page,webview] [--max-chars N] [--format text|json]`
+### `wfb chrome inspect [--target-id ID] [--port N] [--include-types page,webview] [--max-chars N] [--selector CSS] [--format text|json]`
 
 Reads bounded tab context from CDP `Runtime.evaluate` and prints JSON by default:
 
@@ -197,11 +199,17 @@ Reads bounded tab context from CDP `Runtime.evaluate` and prints JSON by default
 - `selected_text`
 - `text_snapshot` (bounded/truncated exactly by `--max-chars`)
 - capture metadata (`captured_at_unix`, length fields, target metadata)
+- `selector`, `selector_matched` when `--selector CSS` is supplied
 
 Inspect defaults are attachment-aware: when using a persisted attachment and no
 explicit `--include-types` is provided, `wfb` auto-includes the attachment
 target type (for example `webview`) so inspect can resolve saved side-panel
 targets without extra flags.
+
+`--selector CSS` evaluates `document.querySelector(selector)` and returns only that
+element's `innerText`. When the selector matches nothing, JSON output reports
+`selector_matched: false`, the snapshot is empty, and a recovery hint is written to
+stderr instead of silently falling back to `body.innerText`.
 
 **Debug-port probing**: `inspect` tries your `--port` (default `9222`) first,
 then other locally detected debugging ports in stable order until
@@ -209,6 +217,69 @@ then other locally detected debugging ports in stable order until
 output is enabled, a top-level `debug` object documents
 `requested_port`, `resolved_port`, and whether a fallback port was used
 (`fallback_used`).
+
+### `wfb chrome ax [--target-id ID] [--port N] [--include-types page,webview] [--role ROLE] [--name SUBSTRING] [--depth N] [--max-nodes N] [--name-max-chars N] [--ignored on|off] [--timeout-seconds F] [--format outline|json]`
+
+Reads the page Accessibility Tree using CDP `Accessibility.getFullAXTree` and renders
+a screen-reader-style outline. Designed to replace the "raise `--max-chars` and re-run"
+pattern on structured pages: outlines are typically an order of magnitude smaller than
+the equivalent `body.innerText` snapshot.
+
+Outline format example:
+
+```
+WebArea
+  main "Conversation"
+    log "Messages"
+      paragraph "Hi there"
+      paragraph "How can I help?"
+    textbox "Compose" focused level=1
+    button "Send" disabled
+```
+
+- `--role ROLE` and `--name SUBSTRING` narrow the rendered outline to subtrees rooted at
+  matching nodes. Useful for "show me only the `main` landmark" or "only the `log`
+  region" without scanning the entire page.
+- `--depth N` is forwarded to CDP as a source-side bound on tree size.
+- `--max-nodes N` (default `600`) caps rendered nodes; `--name-max-chars N` (default
+  `120`) truncates very long accessible names with a `"…(+N chars)"` indicator.
+- `--ignored on` includes AX nodes flagged as ignored (default skips them and re-emits
+  their non-ignored children at the parent depth, matching screen-reader behavior).
+- JSON output includes `outline_meta`, `ax_quality` (`meaningful_roles`,
+  `generic_roles`, `meaningful_ratio`), filter echo, normalized `nodes` (with
+  `backend_dom_node_id` for future write-path commands), and `debug`.
+
+Example:
+
+```sh
+wfb chrome ax --format outline
+wfb chrome ax --format json --role textbox
+wfb chrome ax --format outline --name "send" --max-nodes 80
+```
+
+### `wfb chrome find --query STRING [--mode text|aom|both] [--target-id ID] [--port N] [--include-types page,webview] [--selector CSS] [--role ROLE] [--max-results N] [--context-chars N] [--max-chars N] [--ax-depth N] [--timeout-seconds F] [--format text|json]`
+
+Searches the page once and returns matches with surrounding context.
+
+- `--mode text` searches the page text snapshot (or selector subtree text). Each match
+  includes `before`, `match`, `after`, and the byte offset.
+- `--mode aom` searches AX node names (case-insensitive) and returns each match plus a
+  role/name breadcrumb path from the AX root.
+- `--mode both` (default) does both and returns each list separately.
+- `--selector CSS` scopes text-mode search to a subtree.
+- `--role ROLE` restricts AOM matches to a specific role.
+
+Designed to replace the "raise `--max-chars` and retry" workflow: instead of repeatedly
+re-fetching larger snapshots, ask exactly the question you want to answer ("does the
+page mention `error`?", "is there a button named `Send`?").
+
+Example:
+
+```sh
+wfb chrome find --query "session expired" --mode both
+wfb chrome find --query "Send" --mode aom --role button --format json
+wfb chrome find --query "TODO" --mode text --selector "main" --context-chars 60
+```
 
 ### `wfb chrome detach`
 
@@ -218,12 +289,13 @@ Clears the persisted attachment file.
 
 Shows the current persisted attachment and endpoint health. Default output is JSON.
 
-### `wfb chrome capture [--target-id ID] [--port N] [--include-types page,webview] [--gemini-only] [--max-chars N] [--format json|text]`
+### `wfb chrome capture [--target-id ID] [--port N] [--include-types page,webview] [--gemini-only] [--max-chars N] [--selector CSS] [--format json|text]`
 
 Runs discover -> attach -> inspect in one deterministic command.
 
 - Defaults to `--include-types page,webview` for side-panel compatibility.
 - Selection priority: explicit `--target-id`, then focused/active target, then heuristic ranking, then first-candidate fallback.
+- `--selector CSS` scopes text snapshot to a subtree (same semantics as `chrome inspect`).
 - JSON output includes `selection`, `target`, `attachment`, `inspect`, and debug ports (`requested_port`, `resolved_port`).
 
 ### `wfb bridge doctor [--port N] [--include-types page,webview] [--gemini-only] [--format json|text]`
@@ -240,40 +312,43 @@ wfb bridge doctor
 wfb bridge doctor --include-types page,webview --gemini-only --format text
 ```
 
-### `wfb bridge ask --prompt "..." [--session ID] [--model MODEL] [--system TEXT] [--port N] [--target-id ID] [--include-types page,webview] [--gemini-only] [--max-chars N] [--format json|text]`
+### `wfb bridge ask --prompt "..." [--session ID] [--model MODEL] [--system TEXT] [--port N] [--target-id ID] [--include-types page,webview] [--gemini-only] [--max-chars N] [--selector CSS] [--capture-mode text|aom|both|auto] [--ax-max-nodes N] [--ax-name-max-chars N] [--format json|text]`
 
 Runs the full browser-to-Gemini pipeline in one command: capture -> prompt envelope -> Gemini ask.
 
-- Captures browser context via the same logic as `chrome capture` (including unified debug-port probing: `requested_port` vs `resolved_port` in the `capture` section when fallback occurs).
-- Builds a versioned prompt envelope embedding the page snapshot and user prompt.
+- Captures browser context via the same logic as `chrome capture`/`chrome ax` (including unified debug-port probing: `requested_port` vs `resolved_port` in the `capture` section when fallback occurs).
+- `--capture-mode auto` (default) inspects the AX tree, picks AOM when the page has at least 5 meaningful AX roles and a `meaningful_ratio >= 0.3`, and falls back to text otherwise. Override with `text`, `aom`, or `both` for a fixed strategy.
+- `--selector CSS` scopes text snapshot to a subtree (same semantics as `chrome inspect`).
+- `--ax-max-nodes` / `--ax-name-max-chars` bound AOM outline size when capture-mode includes AOM.
+- Builds a versioned prompt envelope (template `"2"`) embedding the chosen capture content and user prompt.
 - Sends the composed prompt to Gemini within the target session (creates one if none active).
 - Appends both the composed prompt and model response to session history.
 
 JSON output includes three provenance sections:
-- `capture`: target selection details, snapshot metadata, debug ports.
-- `prompt_envelope`: template version, original user prompt, composed prompt character count.
+- `capture`: target selection, snapshot metadata, `selector`/`selector_matched`, `mode_requested`/`mode_chosen`/`mode_reason`, `ax_quality`, debug ports.
+- `prompt_envelope`: template version, original user prompt, composed prompt character count, and `budget` (chosen capture mode, text snapshot chars/truncation, AX total/rendered nodes, outline truncation).
 - `gemini_response`: model, session id, full answer text.
 
 Example:
 
 ```sh
 wfb bridge ask --prompt "summarize the feedback on this page" --format json
-wfb bridge ask --prompt "extract the test failures" --gemini-only --format text
+wfb bridge ask --prompt "extract the test failures" --capture-mode aom --format text
+wfb bridge ask --prompt "what's in the main article?" --selector "main article"
 ```
 
-### `wfb bridge loop --prompt "..." [--max-iterations N] [--stability-check on|off] [--session ID] [--model MODEL] [--system TEXT] [--port N] [--target-id ID] [--include-types page,webview] [--gemini-only] [--max-chars N] [--format json|text]`
+### `wfb bridge loop --prompt "..." [--max-iterations N] [--stability-check on|off] [--session ID] [--model MODEL] [--system TEXT] [--port N] [--target-id ID] [--include-types page,webview] [--gemini-only] [--max-chars N] [--selector CSS] [--capture-mode text|aom|both|auto] [--ax-max-nodes N] [--ax-name-max-chars N] [--format json|text]`
 
 Runs a bounded iterative automation loop: each iteration captures browser context and asks Gemini about it.
 
-- Uses the same capture path as `wfb bridge ask` / `chrome capture` for port probing and provenance (`requested_port`/`resolved_port` per iteration).
-
+- Uses the same capture path as `wfb bridge ask` for port probing, capture-mode selection, and provenance (`requested_port`/`resolved_port` per iteration).
 - `--max-iterations N` (default 3): hard upper bound on iterations.
-- `--stability-check on`: stops early if the page snapshot is unchanged between iterations.
-- Each iteration produces full provenance in the output transcript.
+- `--stability-check on`: stops early if the captured content (text snapshot and/or AX outline depending on capture mode) is unchanged between iterations.
+- Each iteration produces full provenance in the output transcript, including the per-iteration `prompt_envelope.budget`.
 
 Stop reasons:
 - `max_iterations`: budget exhausted normally.
-- `no_change`: stability check detected identical snapshots.
+- `no_change`: stability check detected identical content.
 - `error`: a capture or ask stage failed (error details in the iteration record).
 
 JSON output includes:
@@ -285,7 +360,7 @@ Example:
 
 ```sh
 wfb bridge loop --prompt "check for new test results" --max-iterations 5 --stability-check on
-wfb bridge loop --prompt "summarize changes" --gemini-only --format text
+wfb bridge loop --prompt "summarize changes" --capture-mode aom --format text
 ```
 
 ## Gemini Sessions For Agents
