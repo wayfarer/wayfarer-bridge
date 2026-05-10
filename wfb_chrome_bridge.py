@@ -21,6 +21,37 @@ DEFAULT_TARGET_TYPES = ("page",)
 SUPPORTED_TARGET_TYPES = frozenset({"page", "webview"})
 DEFAULT_PORT_CANDIDATES = (9222, 9223, 9224, 9333)
 
+DEFAULT_AX_MAX_NODES = 600
+DEFAULT_AX_NAME_MAX_CHARS = 120
+GENERIC_AX_ROLES = frozenset(
+    {
+        "generic",
+        "group",
+        "section",
+        "none",
+        "presentation",
+        "GenericContainer",
+        "InlineTextBox",
+        "LineBreak",
+        "RootWebArea",
+    }
+)
+MEANINGFUL_AX_PROPERTY_NAMES = (
+    "focused",
+    "selected",
+    "expanded",
+    "disabled",
+    "checked",
+    "pressed",
+    "level",
+    "required",
+    "invalid",
+    "modal",
+    "readonly",
+    "multiline",
+    "autocomplete",
+)
+
 
 class ChromeBridgeError(Exception):
     """Chrome bridge operation failed."""
@@ -487,20 +518,39 @@ def inspect_target(
     ws_url: str,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_chars: int = MAX_TEXT_SNAPSHOT_CHARS,
+    selector: str | None = None,
 ) -> dict[str, Any]:
-    expression = """
-(() => {
-  const selected = (window.getSelection && window.getSelection()) ? String(window.getSelection()) : "";
-  const bodyText = document && document.body ? (document.body.innerText || "") : "";
-  const text = selected && selected.trim() ? selected : bodyText;
-  return {
-    url: String(location.href || ""),
-    title: String(document.title || ""),
-    selected_text: selected,
-    text_snapshot: text
-  };
-})()
-""".strip()
+    selector_js = json.dumps(selector) if isinstance(selector, str) else "null"
+    expression = (
+        "(() => {"
+        f"const selectorRaw = {selector_js};"
+        "const selected = (window.getSelection && window.getSelection()) ? String(window.getSelection()) : '';"
+        "let root = null;"
+        "let selectorMatched = false;"
+        "if (selectorRaw === null) {"
+        "  root = document && document.body ? document.body : null;"
+        "  selectorMatched = !!root;"
+        "} else {"
+        "  try {"
+        "    root = document.querySelector(selectorRaw);"
+        "    selectorMatched = !!root;"
+        "  } catch (e) {"
+        "    root = null;"
+        "    selectorMatched = false;"
+        "  }"
+        "}"
+        "const rootText = root ? (root.innerText || '') : '';"
+        "const useSelected = (selectorRaw === null) && selected && selected.trim();"
+        "const text = useSelected ? selected : rootText;"
+        "return {"
+        "  url: String(location.href || ''),"
+        "  title: String(document.title || ''),"
+        "  selected_text: selected,"
+        "  text_snapshot: text,"
+        "  selector_matched: selectorMatched"
+        "};"
+        "})()"
+    )
 
     with CDPConnection(ws_url, timeout_seconds=timeout_seconds) as cdp:
         result = cdp.call(
@@ -515,6 +565,14 @@ def inspect_target(
         raise ChromeBridgeError("unexpected Runtime.evaluate response value")
     text = str(value.get("text_snapshot", ""))
     truncated = len(text) > max_chars
+    raw_selector_matched = value.get("selector_matched")
+    selector_matched: bool | None
+    if selector is None:
+        selector_matched = None
+    elif isinstance(raw_selector_matched, bool):
+        selector_matched = raw_selector_matched
+    else:
+        selector_matched = False
     return {
         "url": str(value.get("url", "")),
         "title": str(value.get("title", "")),
@@ -523,4 +581,443 @@ def inspect_target(
         "text_snapshot_chars": min(len(text), max_chars),
         "text_snapshot_truncated": truncated,
         "captured_at_unix": int(time.time()),
+        "selector": selector,
+        "selector_matched": selector_matched,
     }
+
+
+def get_accessibility_tree(
+    *,
+    ws_url: str,
+    depth: int | None = None,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    """Fetch the full accessibility tree for the page and return raw AX nodes.
+
+    Calls Accessibility.enable, getFullAXTree, then best-effort disable.
+    """
+    params: dict[str, Any] | None = None
+    if depth is not None:
+        params = {"depth": int(depth)}
+    with CDPConnection(ws_url, timeout_seconds=timeout_seconds) as cdp:
+        cdp.call("Accessibility.enable")
+        try:
+            result = cdp.call("Accessibility.getFullAXTree", params)
+        finally:
+            try:
+                cdp.call("Accessibility.disable")
+            except ChromeBridgeError:
+                pass
+    nodes = result.get("nodes")
+    if not isinstance(nodes, list):
+        raise ChromeBridgeError("Accessibility.getFullAXTree returned no nodes")
+    return [n for n in nodes if isinstance(n, dict)]
+
+
+def _ax_value(field: Any) -> Any:
+    if isinstance(field, dict):
+        return field.get("value")
+    return None
+
+
+def normalize_ax_node(raw: dict[str, Any]) -> dict[str, Any]:
+    """Convert one CDP AXNode into a compact normalized dict."""
+    role_value = _ax_value(raw.get("role"))
+    name_value = _ax_value(raw.get("name"))
+    value_value = _ax_value(raw.get("value"))
+    description_value = _ax_value(raw.get("description"))
+
+    properties: list[dict[str, Any]] = []
+    raw_props = raw.get("properties")
+    if isinstance(raw_props, list):
+        for prop in raw_props:
+            if not isinstance(prop, dict):
+                continue
+            p_name = prop.get("name")
+            p_value = _ax_value(prop.get("value"))
+            if isinstance(p_name, str):
+                properties.append({"name": p_name, "value": p_value})
+
+    child_ids: list[str] = []
+    raw_children = raw.get("childIds")
+    if isinstance(raw_children, list):
+        for cid in raw_children:
+            if isinstance(cid, str):
+                child_ids.append(cid)
+
+    parent_raw = raw.get("parentId")
+    parent_id = parent_raw if isinstance(parent_raw, str) and parent_raw else None
+    backend_raw = raw.get("backendDOMNodeId")
+    backend_dom_node_id = backend_raw if isinstance(backend_raw, int) else None
+
+    return {
+        "node_id": str(raw.get("nodeId", "")),
+        "parent_id": parent_id,
+        "backend_dom_node_id": backend_dom_node_id,
+        "role": str(role_value) if isinstance(role_value, str) and role_value else None,
+        "name": str(name_value) if isinstance(name_value, str) and name_value else None,
+        "value": str(value_value) if isinstance(value_value, str) and value_value else None,
+        "description": (
+            str(description_value)
+            if isinstance(description_value, str) and description_value
+            else None
+        ),
+        "ignored": bool(raw.get("ignored", False)),
+        "properties": properties,
+        "child_ids": child_ids,
+    }
+
+
+def normalize_ax_tree(raw_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [normalize_ax_node(n) for n in raw_nodes if isinstance(n, dict)]
+
+
+def filter_ax_nodes(
+    nodes: list[dict[str, Any]],
+    *,
+    role: str | None = None,
+    name: str | None = None,
+    include_ignored: bool = False,
+) -> list[dict[str, Any]]:
+    """Return nodes that match role (exact, case-insensitive) and name (substring)."""
+    if not nodes:
+        return []
+    role_match = role.strip().lower() if isinstance(role, str) and role.strip() else None
+    name_pattern = name.strip().lower() if isinstance(name, str) and name.strip() else None
+    out: list[dict[str, Any]] = []
+    for n in nodes:
+        if not include_ignored and n.get("ignored"):
+            continue
+        if role_match is not None:
+            r = (n.get("role") or "").lower()
+            if r != role_match:
+                continue
+        if name_pattern is not None:
+            nm = (n.get("name") or "").lower()
+            if name_pattern not in nm:
+                continue
+        out.append(n)
+    return out
+
+
+def select_ax_subtrees(
+    nodes: list[dict[str, Any]],
+    *,
+    role: str | None = None,
+    name: str | None = None,
+    include_ignored: bool = False,
+) -> list[dict[str, Any]]:
+    """Return nodes for subtrees rooted at nodes matching role/name filters.
+
+    Matched nodes are re-parented to be roots so the renderer treats them as the
+    new top-level. Their descendants are kept verbatim.
+    """
+    role_match = role.strip().lower() if isinstance(role, str) and role.strip() else None
+    name_pattern = name.strip().lower() if isinstance(name, str) and name.strip() else None
+    if role_match is None and name_pattern is None:
+        return nodes
+    matched = filter_ax_nodes(
+        nodes,
+        role=role,
+        name=name,
+        include_ignored=include_ignored,
+    )
+    if not matched:
+        return []
+
+    by_id = {n["node_id"]: n for n in nodes if n.get("node_id")}
+    keep_ids: set[str] = set()
+
+    def collect(node_id: str) -> None:
+        if not node_id or node_id in keep_ids:
+            return
+        keep_ids.add(node_id)
+        node = by_id.get(node_id)
+        if node is None:
+            return
+        for cid in node.get("child_ids") or []:
+            collect(cid)
+
+    matched_ids: set[str] = set()
+    for m in matched:
+        nid = m.get("node_id")
+        if isinstance(nid, str) and nid:
+            matched_ids.add(nid)
+            collect(nid)
+
+    out_nodes: list[dict[str, Any]] = []
+    for n in nodes:
+        nid = n.get("node_id")
+        if not isinstance(nid, str) or nid not in keep_ids:
+            continue
+        if nid in matched_ids:
+            new_node = dict(n)
+            new_node["parent_id"] = None
+            out_nodes.append(new_node)
+        else:
+            out_nodes.append(n)
+    return out_nodes
+
+
+def _ax_outline_name_token(name: str | None, *, max_chars: int) -> str:
+    if not isinstance(name, str) or not name:
+        return ""
+    flattened = name.replace("\n", " ").replace("\r", " ").strip()
+    if not flattened:
+        return ""
+    if len(flattened) > max_chars:
+        truncated = flattened[:max_chars]
+        more = len(flattened) - max_chars
+        return f'"{truncated}\u2026 (+{more} chars)"'
+    return f'"{flattened}"'
+
+
+def _ax_outline_state_suffix(properties: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for prop in properties or []:
+        if not isinstance(prop, dict):
+            continue
+        p_name = prop.get("name")
+        if p_name not in MEANINGFUL_AX_PROPERTY_NAMES:
+            continue
+        value = prop.get("value")
+        if isinstance(value, bool):
+            if value:
+                parts.append(str(p_name))
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            parts.append(f"{p_name}={value}")
+        elif isinstance(value, str) and value:
+            parts.append(f"{p_name}={value}")
+    if not parts:
+        return ""
+    return " " + " ".join(parts)
+
+
+def render_ax_outline(
+    nodes: list[dict[str, Any]],
+    *,
+    max_nodes: int | None = None,
+    name_max_chars: int = DEFAULT_AX_NAME_MAX_CHARS,
+    indent_step: str = "  ",
+    include_ignored: bool = False,
+) -> dict[str, Any]:
+    """Render normalized AX nodes into an indented, screen-reader-style outline.
+
+    Ignored nodes are skipped (their children are emitted at the parent depth)
+    unless `include_ignored=True`. Returns dict with `text`, `rendered_count`,
+    `total_count`, `truncated`.
+    """
+    if not nodes:
+        return {"text": "", "rendered_count": 0, "total_count": 0, "truncated": False}
+
+    by_id: dict[str, dict[str, Any]] = {}
+    child_set: set[str] = set()
+    for n in nodes:
+        nid = n.get("node_id")
+        if isinstance(nid, str) and nid:
+            by_id[nid] = n
+        for cid in n.get("child_ids") or []:
+            if isinstance(cid, str):
+                child_set.add(cid)
+
+    roots: list[dict[str, Any]] = []
+    for n in nodes:
+        nid = n.get("node_id")
+        if not isinstance(nid, str) or not nid:
+            continue
+        explicit_parent = n.get("parent_id")
+        if explicit_parent in by_id:
+            continue
+        if not explicit_parent and nid in child_set:
+            continue
+        roots.append(n)
+
+    lines: list[str] = []
+    state = {"rendered": 0, "truncated": False}
+
+    def emit(node: dict[str, Any], depth: int) -> bool:
+        if max_nodes is not None and state["rendered"] >= max_nodes:
+            state["truncated"] = True
+            return False
+        ignored = bool(node.get("ignored", False))
+        if ignored and not include_ignored:
+            for cid in node.get("child_ids") or []:
+                child = by_id.get(cid)
+                if child is None:
+                    continue
+                if not emit(child, depth):
+                    return False
+            return True
+        role = node.get("role") or "(no-role)"
+        name_token = _ax_outline_name_token(node.get("name"), max_chars=name_max_chars)
+        state_suffix = _ax_outline_state_suffix(node.get("properties") or [])
+        line = f"{indent_step * depth}{role}"
+        if name_token:
+            line += f" {name_token}"
+        if state_suffix:
+            line += state_suffix
+        lines.append(line)
+        state["rendered"] += 1
+        for cid in node.get("child_ids") or []:
+            child = by_id.get(cid)
+            if child is None:
+                continue
+            if not emit(child, depth + 1):
+                return False
+        return True
+
+    for r in roots:
+        if not emit(r, 0):
+            break
+
+    return {
+        "text": "\n".join(lines),
+        "rendered_count": state["rendered"],
+        "total_count": len(nodes),
+        "truncated": state["truncated"],
+    }
+
+
+def ax_quality_stats(nodes: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute role-quality stats used by bridge auto-mode."""
+    total = len(nodes)
+    if total == 0:
+        return {
+            "total": 0,
+            "non_ignored": 0,
+            "meaningful_roles": 0,
+            "generic_roles": 0,
+            "meaningful_ratio": 0.0,
+        }
+    non_ignored = 0
+    meaningful = 0
+    generic = 0
+    for n in nodes:
+        if n.get("ignored"):
+            continue
+        non_ignored += 1
+        role = (n.get("role") or "").strip()
+        if not role:
+            continue
+        if role in GENERIC_AX_ROLES:
+            generic += 1
+        else:
+            meaningful += 1
+    ratio = (meaningful / non_ignored) if non_ignored else 0.0
+    return {
+        "total": total,
+        "non_ignored": non_ignored,
+        "meaningful_roles": meaningful,
+        "generic_roles": generic,
+        "meaningful_ratio": ratio,
+    }
+
+
+def find_in_ax_tree(
+    nodes: list[dict[str, Any]],
+    *,
+    query: str,
+    role: str | None = None,
+    max_results: int | None = None,
+    include_ignored: bool = False,
+) -> list[dict[str, Any]]:
+    """Find AX nodes whose name/value/description contain the query (case-insensitive).
+
+    Returns each match with a role/name breadcrumb path from the AX root.
+    """
+    if not isinstance(query, str) or not query.strip():
+        return []
+    q = query.strip().lower()
+    role_match = role.strip().lower() if isinstance(role, str) and role.strip() else None
+
+    by_id = {n["node_id"]: n for n in nodes if n.get("node_id")}
+    parent_of: dict[str, str] = {}
+    for n in nodes:
+        nid = n.get("node_id")
+        if not isinstance(nid, str) or not nid:
+            continue
+        for cid in n.get("child_ids") or []:
+            if isinstance(cid, str):
+                parent_of[cid] = nid
+
+    def path_for(node_id: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cur: str | None = node_id
+        while cur and cur not in seen:
+            seen.add(cur)
+            n = by_id.get(cur)
+            if n is None:
+                break
+            out.append({"role": n.get("role"), "name": n.get("name")})
+            cur = parent_of.get(cur)
+        return list(reversed(out))
+
+    matches: list[dict[str, Any]] = []
+    for n in nodes:
+        if not include_ignored and n.get("ignored"):
+            continue
+        if role_match is not None and (n.get("role") or "").lower() != role_match:
+            continue
+        haystack_parts: list[str] = []
+        for key in ("name", "value", "description"):
+            val = n.get(key)
+            if isinstance(val, str) and val:
+                haystack_parts.append(val)
+        haystack = " ".join(haystack_parts).lower()
+        if not haystack or q not in haystack:
+            continue
+        nid_raw = n.get("node_id", "")
+        nid = nid_raw if isinstance(nid_raw, str) else ""
+        matches.append(
+            {
+                "node_id": nid,
+                "role": n.get("role"),
+                "name": n.get("name"),
+                "value": n.get("value"),
+                "backend_dom_node_id": n.get("backend_dom_node_id"),
+                "path": path_for(nid),
+            }
+        )
+        if max_results is not None and len(matches) >= max_results:
+            break
+    return matches
+
+
+def find_text_matches(
+    *,
+    text: str,
+    query: str,
+    max_results: int | None = None,
+    context_chars: int = 200,
+) -> list[dict[str, Any]]:
+    """Find all (case-insensitive) occurrences of `query` in `text` with context windows."""
+    if not isinstance(text, str) or not text:
+        return []
+    if not isinstance(query, str) or not query:
+        return []
+    if context_chars < 0:
+        context_chars = 0
+    q_lower = query.lower()
+    text_lower = text.lower()
+    matches: list[dict[str, Any]] = []
+    cursor = 0
+    while True:
+        idx = text_lower.find(q_lower, cursor)
+        if idx == -1:
+            break
+        end = idx + len(query)
+        before_start = max(0, idx - context_chars)
+        after_end = min(len(text), end + context_chars)
+        matches.append(
+            {
+                "offset": idx,
+                "before": text[before_start:idx],
+                "match": text[idx:end],
+                "after": text[end:after_end],
+            }
+        )
+        if max_results is not None and len(matches) >= max_results:
+            break
+        cursor = end if end > cursor else cursor + 1
+    return matches

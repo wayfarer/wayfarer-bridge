@@ -252,6 +252,317 @@ class TestWfbChromeBridge(unittest.TestCase):
         self.assertEqual(out["text_snapshot_chars"], 4)
         self.assertEqual(out["text_snapshot_truncated"], True)
 
+    def test_inspect_target_passes_selector_into_runtime_evaluate(self):
+        fake_result = {
+            "result": {
+                "value": {
+                    "url": "https://example.test",
+                    "title": "Example",
+                    "selected_text": "",
+                    "text_snapshot": "scoped text",
+                    "selector_matched": True,
+                }
+            }
+        }
+        with mock.patch.object(bridge, "CDPConnection") as conn_cls:
+            cm = conn_cls.return_value.__enter__.return_value
+            cm.call.return_value = fake_result
+            out = bridge.inspect_target(
+                ws_url="ws://127.0.0.1:9222/devtools/page/x",
+                selector="main article",
+            )
+        kwargs = cm.call.call_args.args
+        self.assertEqual(kwargs[0], "Runtime.evaluate")
+        expression = kwargs[1]["expression"]
+        self.assertIn('"main article"', expression)
+        self.assertEqual(out["selector"], "main article")
+        self.assertEqual(out["selector_matched"], True)
+        self.assertEqual(out["text_snapshot"], "scoped text")
+
+    def test_inspect_target_reports_selector_unmatched(self):
+        fake_result = {
+            "result": {
+                "value": {
+                    "url": "https://example.test",
+                    "title": "Example",
+                    "selected_text": "",
+                    "text_snapshot": "",
+                    "selector_matched": False,
+                }
+            }
+        }
+        with mock.patch.object(bridge, "CDPConnection") as conn_cls:
+            cm = conn_cls.return_value.__enter__.return_value
+            cm.call.return_value = fake_result
+            out = bridge.inspect_target(
+                ws_url="ws://127.0.0.1:9222/devtools/page/x",
+                selector=".missing",
+            )
+        self.assertEqual(out["selector_matched"], False)
+        self.assertEqual(out["text_snapshot"], "")
+
+
+class TestAccessibilityTree(unittest.TestCase):
+    @staticmethod
+    def _ax(node_id, role, name=None, child_ids=None, ignored=False, properties=None, parent_id=None):
+        node = {
+            "nodeId": node_id,
+            "ignored": ignored,
+            "role": {"type": "internalRole", "value": role},
+            "childIds": child_ids or [],
+        }
+        if name is not None:
+            node["name"] = {"type": "computedString", "value": name}
+        if parent_id is not None:
+            node["parentId"] = parent_id
+        if properties is not None:
+            node["properties"] = properties
+        return node
+
+    def test_get_accessibility_tree_calls_enable_get_disable(self):
+        nodes_payload = {"nodes": [self._ax("1", "main")]}
+        with mock.patch.object(bridge, "CDPConnection") as conn_cls:
+            cm = conn_cls.return_value.__enter__.return_value
+            cm.call.side_effect = [{}, nodes_payload, {}]
+            nodes = bridge.get_accessibility_tree(
+                ws_url="ws://127.0.0.1:9222/devtools/page/x",
+            )
+        method_calls = [c.args[0] for c in cm.call.call_args_list]
+        self.assertEqual(method_calls, ["Accessibility.enable", "Accessibility.getFullAXTree", "Accessibility.disable"])
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0]["nodeId"], "1")
+
+    def test_get_accessibility_tree_passes_depth_param(self):
+        with mock.patch.object(bridge, "CDPConnection") as conn_cls:
+            cm = conn_cls.return_value.__enter__.return_value
+            cm.call.side_effect = [{}, {"nodes": []}, {}]
+            bridge.get_accessibility_tree(ws_url="ws://x", depth=4)
+        get_call = cm.call.call_args_list[1]
+        self.assertEqual(get_call.args[0], "Accessibility.getFullAXTree")
+        self.assertEqual(get_call.args[1], {"depth": 4})
+
+    def test_get_accessibility_tree_disable_failure_is_swallowed(self):
+        with mock.patch.object(bridge, "CDPConnection") as conn_cls:
+            cm = conn_cls.return_value.__enter__.return_value
+            cm.call.side_effect = [
+                {},
+                {"nodes": [self._ax("1", "main")]},
+                bridge.ChromeBridgeError("disable failed"),
+            ]
+            nodes = bridge.get_accessibility_tree(ws_url="ws://x")
+        self.assertEqual(len(nodes), 1)
+
+    def test_get_accessibility_tree_invalid_payload_raises(self):
+        with mock.patch.object(bridge, "CDPConnection") as conn_cls:
+            cm = conn_cls.return_value.__enter__.return_value
+            cm.call.side_effect = [{}, {"unexpected": True}, {}]
+            with self.assertRaises(bridge.ChromeBridgeError):
+                bridge.get_accessibility_tree(ws_url="ws://x")
+
+    def test_normalize_ax_node_extracts_role_name_value_props(self):
+        raw = {
+            "nodeId": "1",
+            "ignored": False,
+            "role": {"type": "internalRole", "value": "button"},
+            "name": {"type": "computedString", "value": "Send"},
+            "value": {"type": "string", "value": "send-id"},
+            "childIds": ["2", "3"],
+            "backendDOMNodeId": 42,
+            "properties": [
+                {"name": "focused", "value": {"type": "boolean", "value": True}},
+                {"name": "level", "value": {"type": "integer", "value": 2}},
+            ],
+        }
+        norm = bridge.normalize_ax_node(raw)
+        self.assertEqual(norm["node_id"], "1")
+        self.assertEqual(norm["role"], "button")
+        self.assertEqual(norm["name"], "Send")
+        self.assertEqual(norm["value"], "send-id")
+        self.assertEqual(norm["child_ids"], ["2", "3"])
+        self.assertEqual(norm["backend_dom_node_id"], 42)
+        self.assertFalse(norm["ignored"])
+        prop_names = [p["name"] for p in norm["properties"]]
+        self.assertIn("focused", prop_names)
+        self.assertIn("level", prop_names)
+
+    def test_filter_ax_nodes_role_match_and_name_substring(self):
+        nodes = bridge.normalize_ax_tree(
+            [
+                self._ax("1", "main"),
+                self._ax("2", "button", name="Send message"),
+                self._ax("3", "button", name="Cancel"),
+                self._ax("4", "textbox", name="Compose", ignored=True),
+            ]
+        )
+        by_role = bridge.filter_ax_nodes(nodes, role="button")
+        self.assertEqual({n["node_id"] for n in by_role}, {"2", "3"})
+        by_name = bridge.filter_ax_nodes(nodes, name="message")
+        self.assertEqual({n["node_id"] for n in by_name}, {"2"})
+        ignored_default = bridge.filter_ax_nodes(nodes, role="textbox")
+        self.assertEqual(ignored_default, [])
+        with_ignored = bridge.filter_ax_nodes(nodes, role="textbox", include_ignored=True)
+        self.assertEqual({n["node_id"] for n in with_ignored}, {"4"})
+
+    def test_select_ax_subtrees_returns_matched_plus_descendants(self):
+        nodes = bridge.normalize_ax_tree(
+            [
+                self._ax("1", "WebArea", child_ids=["2", "3"]),
+                self._ax("2", "main", name="Conversation", child_ids=["4"], parent_id="1"),
+                self._ax("3", "navigation", child_ids=["5"], parent_id="1"),
+                self._ax("4", "paragraph", name="Hello", parent_id="2"),
+                self._ax("5", "link", name="Home", parent_id="3"),
+            ]
+        )
+        subtrees = bridge.select_ax_subtrees(nodes, role="main")
+        ids = sorted(n["node_id"] for n in subtrees)
+        self.assertEqual(ids, ["2", "4"])
+        roots = [n for n in subtrees if n.get("parent_id") is None]
+        self.assertEqual([n["node_id"] for n in roots], ["2"])
+
+    def test_select_ax_subtrees_no_match_returns_empty(self):
+        nodes = bridge.normalize_ax_tree([self._ax("1", "main")])
+        self.assertEqual(bridge.select_ax_subtrees(nodes, role="missing"), [])
+
+    def test_render_ax_outline_indents_and_skips_ignored(self):
+        nodes = bridge.normalize_ax_tree(
+            [
+                self._ax("1", "WebArea", child_ids=["2"]),
+                self._ax(
+                    "2",
+                    "main",
+                    name="Conversation",
+                    child_ids=["3", "4"],
+                    parent_id="1",
+                ),
+                self._ax("3", "generic", child_ids=["5"], parent_id="2", ignored=True),
+                self._ax(
+                    "4",
+                    "button",
+                    name="Send",
+                    parent_id="2",
+                    properties=[
+                        {"name": "focused", "value": {"type": "boolean", "value": True}},
+                        {"name": "level", "value": {"type": "integer", "value": 2}},
+                    ],
+                ),
+                self._ax("5", "paragraph", name="Hi", parent_id="3"),
+            ]
+        )
+        out = bridge.render_ax_outline(nodes)
+        lines = out["text"].splitlines()
+        self.assertEqual(lines[0], "WebArea")
+        self.assertEqual(lines[1], '  main "Conversation"')
+        self.assertEqual(lines[2], '    paragraph "Hi"')
+        self.assertEqual(lines[3], '    button "Send" focused level=2')
+        self.assertEqual(out["rendered_count"], 4)
+        self.assertEqual(out["total_count"], 5)
+        self.assertFalse(out["truncated"])
+
+    def test_render_ax_outline_max_nodes_truncates(self):
+        nodes = bridge.normalize_ax_tree(
+            [
+                self._ax("1", "main", child_ids=["2", "3", "4"]),
+                self._ax("2", "paragraph", name="A", parent_id="1"),
+                self._ax("3", "paragraph", name="B", parent_id="1"),
+                self._ax("4", "paragraph", name="C", parent_id="1"),
+            ]
+        )
+        out = bridge.render_ax_outline(nodes, max_nodes=2)
+        self.assertEqual(out["rendered_count"], 2)
+        self.assertTrue(out["truncated"])
+        self.assertEqual(len(out["text"].splitlines()), 2)
+
+    def test_render_ax_outline_truncates_long_names(self):
+        long = "x" * 500
+        nodes = bridge.normalize_ax_tree([self._ax("1", "paragraph", name=long)])
+        out = bridge.render_ax_outline(nodes, name_max_chars=40)
+        self.assertIn("(+460 chars)", out["text"])
+
+    def test_render_ax_outline_handles_empty_input(self):
+        out = bridge.render_ax_outline([])
+        self.assertEqual(out["text"], "")
+        self.assertEqual(out["rendered_count"], 0)
+        self.assertEqual(out["total_count"], 0)
+
+    def test_ax_quality_stats_distinguishes_meaningful_and_generic(self):
+        nodes = bridge.normalize_ax_tree(
+            [
+                self._ax("1", "main"),
+                self._ax("2", "button"),
+                self._ax("3", "generic"),
+                self._ax("4", "section"),
+                self._ax("5", "ignored", ignored=True),
+            ]
+        )
+        stats = bridge.ax_quality_stats(nodes)
+        self.assertEqual(stats["total"], 5)
+        self.assertEqual(stats["non_ignored"], 4)
+        self.assertEqual(stats["meaningful_roles"], 2)
+        self.assertEqual(stats["generic_roles"], 2)
+        self.assertAlmostEqual(stats["meaningful_ratio"], 0.5, places=2)
+
+    def test_ax_quality_stats_empty_input(self):
+        stats = bridge.ax_quality_stats([])
+        self.assertEqual(stats["total"], 0)
+        self.assertEqual(stats["meaningful_ratio"], 0.0)
+
+    def test_find_in_ax_tree_returns_breadcrumb_and_match_metadata(self):
+        nodes = bridge.normalize_ax_tree(
+            [
+                self._ax("1", "main", name="Page", child_ids=["2"]),
+                self._ax("2", "log", name="Conversation", child_ids=["3"], parent_id="1"),
+                self._ax("3", "paragraph", name="Find this exact phrase here", parent_id="2"),
+            ]
+        )
+        matches = bridge.find_in_ax_tree(nodes, query="exact phrase")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["node_id"], "3")
+        self.assertEqual(matches[0]["role"], "paragraph")
+        self.assertEqual([p["role"] for p in matches[0]["path"]], ["main", "log", "paragraph"])
+
+    def test_find_in_ax_tree_role_filter_and_max_results(self):
+        nodes = bridge.normalize_ax_tree(
+            [
+                self._ax("1", "button", name="match button"),
+                self._ax("2", "button", name="other match"),
+                self._ax("3", "link", name="match link"),
+            ]
+        )
+        only_buttons = bridge.find_in_ax_tree(nodes, query="match", role="button")
+        self.assertEqual({m["node_id"] for m in only_buttons}, {"1", "2"})
+        capped = bridge.find_in_ax_tree(nodes, query="match", max_results=1)
+        self.assertEqual(len(capped), 1)
+
+    def test_find_in_ax_tree_skips_ignored_by_default(self):
+        nodes = bridge.normalize_ax_tree(
+            [
+                self._ax("1", "button", name="match here", ignored=True),
+                self._ax("2", "button", name="match here"),
+            ]
+        )
+        results = bridge.find_in_ax_tree(nodes, query="match")
+        self.assertEqual({m["node_id"] for m in results}, {"2"})
+
+    def test_find_text_matches_returns_context_windows(self):
+        text = "before NEEDLE inside text and another NEEDLE later"
+        matches = bridge.find_text_matches(text=text, query="needle", context_chars=7)
+        self.assertEqual(len(matches), 2)
+        self.assertEqual(matches[0]["match"], "NEEDLE")
+        self.assertEqual(matches[0]["before"], "before ")
+        self.assertEqual(matches[0]["after"], " inside")
+        self.assertEqual(matches[1]["offset"], text.index("NEEDLE", 10))
+
+    def test_find_text_matches_max_results_caps_output(self):
+        text = "ababab"
+        out = bridge.find_text_matches(text=text, query="a", max_results=2)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["offset"], 0)
+        self.assertEqual(out[1]["offset"], 2)
+
+    def test_find_text_matches_empty_inputs(self):
+        self.assertEqual(bridge.find_text_matches(text="", query="x"), [])
+        self.assertEqual(bridge.find_text_matches(text="x", query=""), [])
+
 
 if __name__ == "__main__":
     unittest.main()
