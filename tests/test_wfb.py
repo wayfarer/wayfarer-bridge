@@ -1677,6 +1677,84 @@ class TestWfb(unittest.TestCase):
             self.assertEqual(payload["selection"]["method"], "heuristic")
             self.assertEqual(payload["target"]["id"], "t1")
             self.assertEqual(payload["debug"]["resolved_port"], 9333)
+            self.assertEqual(payload.get("warnings"), [])
+
+    def test_capture_target_warnings_empty_for_single_target(self):
+        one = {"id": "a", "url": "https://a.test", "type": "page"}
+        self.assertEqual(
+            wfb._capture_target_warnings([one], selection_method="heuristic"),
+            [],
+        )
+
+    def test_capture_target_warnings_multi_heuristic(self):
+        targets = [
+            {"id": "a", "url": "https://a.test", "type": "page"},
+            {"id": "b", "url": "https://b.test", "type": "page"},
+        ]
+        lines = wfb._capture_target_warnings(targets, selection_method="heuristic")
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Multiple targets", lines[0])
+        self.assertIn("Chrome did not report any target as active", lines[0])
+
+    def test_capture_target_warnings_focused_suppresses_heuristic_message(self):
+        targets = [
+            {"id": "a", "active": True, "url": "https://a.test", "type": "page"},
+            {"id": "b", "url": "https://b.test", "type": "page"},
+        ]
+        self.assertEqual(
+            wfb._capture_target_warnings(targets, selection_method="focused"),
+            [],
+        )
+
+    def test_capture_target_warnings_explicit_id_multi_target(self):
+        targets = [
+            {"id": "a", "url": "https://a.test", "type": "page"},
+            {"id": "b", "url": "https://b.test", "type": "page"},
+        ]
+        self.assertEqual(
+            wfb._capture_target_warnings(targets, selection_method="explicit_id"),
+            [],
+        )
+
+    def test_chrome_capture_multi_target_heuristic_includes_warnings_json(self):
+        t1 = {
+            "id": "t1",
+            "title": "Tab one",
+            "url": "https://one.example/",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        t2 = {
+            "id": "t2",
+            "title": "Tab two",
+            "url": "https://two.example/",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t2",
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch(
+                "wfb._list_targets_with_port_fallback",
+                return_value=([t1, t2], 9222),
+            ),
+            mock.patch(
+                "wfb.select_capture_target",
+                return_value=(t1, "heuristic", "selected by heuristic ranking"),
+            ),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch(
+                "wfb.inspect_target",
+                return_value={"text_snapshot": "hi", "text_snapshot_chars": 2},
+            ),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["chrome", "capture", "--format", "json"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(len(payload["warnings"]), 1)
+            self.assertIn("Multiple targets", payload["warnings"][0])
 
     def test_chrome_capture_selection_error_includes_recovery_hint(self):
         with (
@@ -1742,6 +1820,63 @@ class TestWfb(unittest.TestCase):
             self.assertEqual(payload["prompt_envelope"]["budget"]["capture_mode"], "text")
             self.assertEqual(payload["gemini_response"]["answer"], "The page discusses Gemini features.")
             self.assertEqual(payload["gemini_response"]["session_id"], "sess_abc")
+            self.assertEqual(payload["capture"].get("warnings"), [])
+
+    def test_bridge_ask_multi_target_heuristic_includes_warnings(self):
+        t1 = {
+            "id": "t1",
+            "title": "A",
+            "url": "https://a.example/",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t1",
+        }
+        t2 = {
+            "id": "t2",
+            "title": "B",
+            "url": "https://b.example/",
+            "type": "page",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/t2",
+        }
+        inspect_result = {
+            "title": "A",
+            "url": "https://a.example/",
+            "text_snapshot": "x",
+            "text_snapshot_chars": 1,
+            "text_snapshot_truncated": False,
+        }
+        fake_session = {
+            "id": "sess_m",
+            "name": "sess_m",
+            "model": "gemini-2.5-flash",
+            "system": None,
+            "messages": [],
+        }
+        with (
+            mock.patch("wfb.wfb_home", return_value=Path("/tmp/fake")),
+            mock.patch("wfb.parse_target_types", return_value=("page", "webview")),
+            mock.patch(
+                "wfb._list_targets_with_port_fallback",
+                return_value=([t1, t2], 9222),
+            ),
+            mock.patch(
+                "wfb.select_capture_target",
+                return_value=(t1, "heuristic", "selected by heuristic ranking"),
+            ),
+            mock.patch("wfb.save_attachment", return_value={"target_id": "t1"}),
+            mock.patch("wfb.inspect_target", return_value=inspect_result),
+            mock.patch("wfb.get_accessibility_tree", return_value=[]),
+            mock.patch("wfb.get_active_session_id", return_value="sess_m"),
+            mock.patch("wfb.load_session", return_value=fake_session),
+            mock.patch("wfb.set_active_session"),
+            mock.patch("wfb.ask_with_messages", return_value="ok"),
+            mock.patch("wfb.append_turn"),
+        ):
+            with mock.patch("sys.stdout") as out:
+                rc = wfb.main(["bridge", "ask", "--prompt", "p"])
+            self.assertEqual(rc, 0)
+            written = "".join(call.args[0] for call in out.write.call_args_list if call.args)
+            payload = json.loads(written)
+            self.assertEqual(len(payload["capture"]["warnings"]), 1)
 
     def test_bridge_ask_text_format(self):
         target = {

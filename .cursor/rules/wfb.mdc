@@ -1,0 +1,27 @@
+---
+description: >-
+  Optional mirror of Wayfarer Bridge CLI guidance for this repository only.
+  Not shipped in the package; pip/users should rely on wfb --help and README.
+globs: wfb.py
+alwaysApply: false
+---
+
+# Wayfarer Bridge CLI (`wfb`)
+
+Canonical instructions for everyone (installed via **pip**, conda, or source): run **`wfb --help`** and read the **Agent workflow guidance** epilog, plus [README.md](../../README.md) and [docs/chrome_remote_debug_bridge.md](../../docs/chrome_remote_debug_bridge.md).
+
+This file repeats the same playbook for contributors editing CLI code in **this repo**. It does **not** apply in other workspaces unless you copy it.
+
+1. **Setup:** `wfb init` once; recovery: `wfb bridge doctor --format json`. **`chrome targets`** / **`chrome attach`** must use the same **`--port`** as the debugger (no automatic port fallback for those commands).
+
+2. **Gemini + Chrome + default AOM selection:** `wfb bridge ask --prompt "…" --format json` (default `--capture-mode auto`). **`wfb bridge loop`** for repeated capture→ask.
+
+3. **Structured page, no Gemini:** `wfb chrome targets --include-types page,webview --format json` → `wfb chrome attach --target-id <id> …` → `wfb chrome ax --format outline` or `wfb chrome find --query "…"`.
+
+4. **Quick text snapshot:** `wfb chrome capture` is bounded **text** only (`inspect`-style). For accessibility-tree context use **`chrome ax`** or **`bridge ask`**.
+
+5. **Stable tab:** **`inspect`**, **`ax`**, **`find`** without **`--target-id`** use the saved attachment. **`capture`** and **`bridge ask`**/**`loop`** re-run tab selection each time.
+
+6. **Multiple tabs:** Prefer **`--target-id`** or attach-then-inspect; check JSON **`warnings`** and **`selection.method`** when unsure.
+
+7. **Sessions:** `wfb gemini session new|use` and `wfb gemini ask --session <id>` for durable chat outside the bridge pipeline.

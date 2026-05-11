@@ -112,6 +112,22 @@ text capture.
 3. Heuristic ranking (prefer non-omnibox targets, then Gemini-signaled targets).
 4. First candidate fallback.
 
+### Agent routing
+
+Use the right command for the goal; tab selection behavior differs:
+
+| Goal | Command |
+|------|---------|
+| Gemini + live page context with default AOM/text auto-selection | `wfb bridge ask` / `wfb bridge loop` (`--capture-mode auto` default) |
+| Read-only accessibility outline or search (no Gemini) | `wfb chrome attach --target-id …` then `wfb chrome ax` / `wfb chrome find` |
+| Quick bounded **text** snapshot only | `wfb chrome capture` (runs `inspect`-style text extraction, **not** AOM) |
+
+Important distinctions:
+
+- **`wfb chrome capture`** is **not** the accessibility tree: it attaches and returns a bounded text snapshot. For AOM, use `chrome ax` or `bridge ask` (which runs `_capture_browser_context` with `--capture-mode`).
+- **`wfb bridge ask`/`loop`** use the same target-selection pipeline as `chrome capture` each time: they **re-resolve** the tab from `/json/list`. **`wfb chrome inspect`**, **`ax`**, and **`find`** without `--target-id` use the **persisted attachment** from `chrome attach` — stable until you change it.
+- **Multiple tabs:** If more than one target matches your filters, blind `capture`/`bridge ask` may pick an unexpected tab (for example a Gemini webview). Prefer **`--target-id`** from `chrome targets`, or attach once and use `inspect`/`ax`/`find`. JSON output includes a **`warnings`** list when selection used a heuristic over multiple candidates or when Chrome did not report an active target.
+
 ## Bridge workflow
 
 `wfb bridge ask` orchestrates the full pipeline:

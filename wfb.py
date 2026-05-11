@@ -82,24 +82,30 @@ BRIDGE_PROMPT_TEMPLATE_VERSION = "2"
 AGENT_WORKFLOW_GUIDANCE = """Agent workflow guidance:
   1) Initialize once: `wfb init`
   2) Diagnostics (blind start):
-       - `wfb bridge doctor --format json` (shows resolved debug port; `chrome targets`/`attach` need matching `--port`, no auto-fallback)
-  3) One-shot browser-to-Gemini bridge:
+       - `wfb bridge doctor --format json` (endpoint, port, attachment hints;
+         `chrome targets`/`attach` need matching `--port`, no auto-fallback)
+  3) Gemini + live Chrome context (AOM-capable, default `--capture-mode auto`):
        - `wfb bridge ask --prompt "summarize this page" --format json`
-       (runs capture -> prompt envelope -> gemini ask in a single call)
-  4) Iterative automation:
+       (selects a tab, captures text and/or accessibility outline, builds prompt, calls Gemini)
        - `wfb bridge loop --prompt "check for updates" --max-iterations 5`
-       (bounded loop: capture -> ask each iteration, stops on budget/stability/error)
-  5) For manual browser-context capture:
-       - `wfb chrome capture --format json`
-       - `wfb chrome targets --include-types page,webview --gemini-only`
-  6) For durable local memory and model control:
-       - create/select session with `wfb gemini session new|use`
-       - run asks with `wfb gemini ask --session <id> ...`
-  7) State ownership:
-       - browser panel text = live context source
+       (same capture pipeline each iteration; stops on budget/stability/error)
+  4) Read-only structured page (no Gemini): after choosing a tab, prefer AOM:
+       - `wfb chrome attach --target-id <id> …` then `wfb chrome ax --format outline`
+         (or `chrome find --query "..."`). Avoid huge `--max-chars` on `chrome inspect`
+         for structured UIs.
+  5) Quick bounded **text** snapshot (re-selects the tab every run — see JSON `warnings`):
+       - `wfb chrome capture --format json` (text only; not AOM — use `bridge ask` or `chrome ax` for AOM)
+  6) Multiple tabs / ambiguous foreground tab:
+       - Run `wfb chrome targets --include-types page,webview --format json`
+       - Pass `--target-id` on `capture`/`bridge ask`/`bridge loop`, **or** attach once then use
+         `chrome inspect`/`ax`/`find` (they follow the saved attachment without re-running capture selection)
+  7) Durable local memory (Gemini sessions without bridge):
+       - `wfb gemini session new|use` then `wfb gemini ask --session <id> ...`
+  8) State ownership:
+       - browser panel text / capture output = live context source
        - local gemini session = durable agent execution history
-  8) Optional persistence:
-       - enable `--sync-world-state on` when chat context should update SQLite world state.
+  9) Optional persistence:
+       - `--sync-world-state on` when chat context should update SQLite world state.
 """
 
 ENVELOPE_KEYS = frozenset(
@@ -138,6 +144,40 @@ class ValidationError(Exception):
 
 def _err(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def _capture_target_warnings(
+    targets: list[dict[str, Any]],
+    *,
+    selection_method: str,
+) -> list[str]:
+    """Human-readable hints when tab selection may not match user intent."""
+    warnings: list[str] = []
+    if len(targets) <= 1:
+        return warnings
+    no_focus = not any(
+        bool(t.get("active")) or bool(t.get("attached")) for t in targets
+    )
+    if selection_method in ("heuristic", "fallback_first"):
+        msg = (
+            "Multiple targets; chose by heuristic — confirm with "
+            "`wfb chrome targets --include-types page,webview --format json` "
+            "or pass `--target-id`. For a stable tab: "
+            "`wfb chrome attach --target-id <id> …` then use "
+            "`inspect`/`ax`/`find`."
+        )
+        if no_focus:
+            msg += (
+                " Chrome did not report any target as active/focused; "
+                "the snapshot may not match the foreground tab."
+            )
+        warnings.append(msg)
+    elif no_focus and selection_method not in ("explicit_id", "focused"):
+        warnings.append(
+            "Multiple targets and Chrome did not report an active/focused target; "
+            "verify tab selection."
+        )
+    return warnings
 
 
 def _is_int(value: Any) -> bool:
@@ -1538,7 +1578,18 @@ def build_parser() -> argparse.ArgumentParser:
     c_detach.add_argument("--format", choices=("text", "json"), default="text")
     c_current = chrome_sub.add_parser("current", help="show current attached target and endpoint health")
     c_current.add_argument("--format", choices=("json", "text"), default="json")
-    c_capture = chrome_sub.add_parser("capture", help="discover, attach, and inspect in one command")
+    c_capture = chrome_sub.add_parser(
+        "capture",
+        help="discover, attach, and inspect in one command",
+        description=(
+            "Discover targets, pick one, persist attachment, and return a bounded **text** snapshot "
+            "(same as `chrome inspect`). Does not fetch the accessibility tree — use "
+            "`wfb chrome ax` or `wfb bridge ask` for AOM / `--capture-mode auto`. "
+            "Re-runs tab selection on every invocation; with multiple tabs pass `--target-id` "
+            "or attach once and use `inspect`/`ax`/`find`."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     c_capture.add_argument("--target-id", help="explicit target id override")
     c_capture.add_argument(
         "--port",
@@ -2493,16 +2544,23 @@ def main(argv: list[str] | None = None) -> int:
                     "type": str(target.get("type", "")),
                 }
                 inspect_payload["debug_port"] = int(resolved_port)
+                cap_warnings = _capture_target_warnings(
+                    targets,
+                    selection_method=selection_method,
+                )
                 payload = {
                     "selection": {"method": selection_method, "reason": selection_reason},
                     "target": inspect_payload["target"],
                     "attachment": attachment,
                     "inspect": inspect_payload,
                     "debug": {"requested_port": int(args.port), "resolved_port": int(resolved_port)},
+                    "warnings": cap_warnings,
                 }
                 if args.format == "json":
                     print(json.dumps(payload, indent=2, sort_keys=True))
                 else:
+                    for line in cap_warnings:
+                        _err(f"wfb: {line}")
                     print(f"selection_method: {selection_method}")
                     print(f"target_id: {payload['target']['id']}")
                     print(f"title: {payload['target']['title']}")
@@ -2959,6 +3017,10 @@ def main(argv: list[str] | None = None) -> int:
                 append_turn(wfb_home(), sid, role="user", text=composed_prompt)
                 append_turn(wfb_home(), sid, role="model", text=answer)
 
+                cap_warnings = _capture_target_warnings(
+                    targets,
+                    selection_method=selection_method,
+                )
                 payload: dict[str, Any] = {
                     "capture": {
                         "selection": {"method": selection_method, "reason": selection_reason},
@@ -2977,6 +3039,7 @@ def main(argv: list[str] | None = None) -> int:
                         "mode_reason": capture_result["mode_reason"],
                         "ax_quality": capture_result["ax_quality"],
                         "debug": {"requested_port": int(args.port), "resolved_port": int(resolved_port)},
+                        "warnings": cap_warnings,
                     },
                     "prompt_envelope": {
                         "template_version": BRIDGE_PROMPT_TEMPLATE_VERSION,
@@ -3000,6 +3063,8 @@ def main(argv: list[str] | None = None) -> int:
                 if args.format == "json":
                     print(json.dumps(payload, indent=2, sort_keys=True))
                 else:
+                    for line in cap_warnings:
+                        _err(f"wfb: {line}")
                     print(f"target: {page_title} ({page_url})")
                     print(f"selection: {selection_method}")
                     print(f"capture_mode: {capture_result['mode_chosen']}")
@@ -3137,6 +3202,10 @@ def main(argv: list[str] | None = None) -> int:
 
                     page_title = capture_result["page_title"]
                     page_url = capture_result["page_url"]
+                    cap_warnings = _capture_target_warnings(
+                        targets,
+                        selection_method=selection_method,
+                    )
                     stability_signature = "\n".join(
                         s for s in (
                             capture_result.get("text_snapshot") or "",
@@ -3166,6 +3235,7 @@ def main(argv: list[str] | None = None) -> int:
                             "mode_reason": capture_result["mode_reason"],
                             "ax_quality": capture_result["ax_quality"],
                             "debug": {"requested_port": int(args.port), "resolved_port": int(resolved_port)},
+                            "warnings": cap_warnings,
                         }
                         step["status"] = "no_change"
                         iterations.append(step)
@@ -3221,6 +3291,7 @@ def main(argv: list[str] | None = None) -> int:
                         "mode_reason": capture_result["mode_reason"],
                         "ax_quality": capture_result["ax_quality"],
                         "debug": {"requested_port": int(args.port), "resolved_port": int(resolved_port)},
+                        "warnings": cap_warnings,
                     }
                     step["prompt_envelope"] = {
                         "template_version": BRIDGE_PROMPT_TEMPLATE_VERSION,
