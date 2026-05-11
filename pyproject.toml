@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wfb"
-version = "0.1.3"
+version = "0.1.4"
 description = "Give terminal agents persistent memory, Gemini OAuth sessions, and live Chrome context with a zero-dependency local CLI"
 readme = "README.md"
 requires-python = ">=3.9"
