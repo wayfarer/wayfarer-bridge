@@ -39,6 +39,7 @@ Still not supported:
 
 - Direct official Gemini API attachment to browser side-panel sessions.
 - A centralized OAuth client secret for the open-source/PyPI path.
+- Full text extraction from virtualized editors (Monaco, CodeMirror, react-window, etc.) embedded in target pages. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
 ## Quick Start
 
